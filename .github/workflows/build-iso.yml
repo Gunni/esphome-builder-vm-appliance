@@ -8,10 +8,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - name: Configure Git advice
+        run: |
+          git config --global advice.defaultBranchName false
+          git config --global advice.detachedHead false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.13'
       - name: Test the builder
@@ -22,7 +26,7 @@ jobs:
         id: fedora
         run: python .download-coreos.py prepare .ci --github-output "$GITHUB_OUTPUT"
       - name: Cache unmodified Fedora ISO
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ci/base.iso
           key: fedora-coreos-stable-x86_64-iso-${{ steps.fedora.outputs.sha256 }}
@@ -31,17 +35,25 @@ jobs:
       - name: Build customized ISO
         run: |
           python -c "from pathlib import Path; Path('build').mkdir(exist_ok=True)"
-          python build-installer.py .ci/base.iso build/esphome-appliance.iso
+          iso_name="esphome-appliance-fcos-$(python -c "import json; print(json.load(open('.ci/selection.json'))['release'])")-${GITHUB_SHA:0:12}.iso"
+          printf 'ISO_NAME=%s\n' "$iso_name" >> "$GITHUB_ENV"
+          python build-installer.py .ci/base.iso "build/$iso_name"
+      - name: Verify serial configuration against the original Fedora ISO
+        run: |
+          printf 'SERIAL_CONSOLE=true\n' > .ci/serial.env
+          python build-installer.py .ci/base.iso .ci/serial.iso --env .ci/serial.env
+          (cd .ci && sha256sum --check serial.iso.sha256)
+          rm .ci/serial.iso .ci/serial.iso.sha256 .ci/serial.env
       - name: Verify artifact checksum
         working-directory: build
-        run: sha256sum --check esphome-appliance.iso.sha256
+        run: sha256sum --check "$ISO_NAME.sha256"
       - name: Upload installer and checksum
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: esphome-appliance-${{ steps.fedora.outputs.release }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: esphome-appliance-${{ steps.fedora.outputs.release }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            build/esphome-appliance.iso
-            build/esphome-appliance.iso.sha256
+            build/${{ env.ISO_NAME }}
+            build/${{ env.ISO_NAME }}.sha256
           if-no-files-found: error
           compression-level: 0
           retention-days: 7

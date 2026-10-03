@@ -9,13 +9,14 @@ import zipfile
 HERE = Path(__file__).resolve().parent
 # Explicit allowlist: never package .env, keys, Git data or generated VM files.
 SOURCE_FILES = (
-    'README.md', 'LICENSE', 'CHANGELOG.md', 'RELEASING.md',
+    'README.md', 'LICENSE',
     'build-installer.py', 'build-release.py', '.download-coreos.py', '.env.example',
     '.esphome-builder.container', '.esphome-tmpfiles.conf', '.motd.txt',
     '.github/workflows/test.yml', '.github/workflows/build-iso.yml',
     '.github/workflows/release.yml',
     'tests/test_builder.py', 'tests/test_download.py',
     'tests/test_disk_selection.py', 'tests/test_provision.py', 'tests/test_release.py',
+    'tests/check_workflow.py',
 )
 
 

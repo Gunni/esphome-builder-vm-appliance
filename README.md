@@ -1,20 +1,22 @@
 # ESPHome VM appliance
 
-This project turns a Fedora CoreOS Live DVD into a guided ESPHome remote-builder installer for Hyper-V, Proxmox and other QEMU/KVM hosts. Python 3.11+ and the standard library are all you need on the build computer. No Docker, WSL or PowerShell wrapper is required.
+This project turns a Fedora CoreOS Live DVD into a guided ESPHome remote-builder installer for Hyper-V, Proxmox and other QEMU/KVM hosts. Python 3.11+ and the standard library are all you need on the build computer.
 
 The guest runs the latest stable ESPHome container using Podman Quadlet, host networking and all allocated VM CPUs. Fedora CoreOS handles OS updates through Zincati. This is a dedicated remote builder for the main ESPHome Device Builder dashboard, not a second dashboard.
 
 **The customized ISO automatically installs to the unique largest writable, non-removable whole disk.** Use a dedicated VM with a fresh disk. The installer refuses tied-largest disks, disks outside its size bounds, partitions or mapped children, mounts or swap, filesystem/partition-table/RAID signatures, and any nonzero data in a full-disk read. It never falls back to a smaller disk when the largest is occupied. The defaults accept a 50–80 GiB disk. The zero-filled check reads the whole disk and can take time; it does not write to it. Installation proceeds only after these checks pass.
 
-## Download the small setup package
+## Download an installer or setup package
 
-Open this repository’s **Releases** page and download:
+Open this repository’s **Releases** page. For a ready-to-boot installer, download **`esphome-appliance-fcos-<Fedora version>-<12-character source SHA>.iso`** and verify it with the matching **`.iso.sha256`** or **`SHA256SUMS`**.
+
+To inspect the configuration and build locally, download:
 
 - **`esphome-appliance-setup.zip`**: the portable Python builder, its templates, generic live Ignition configuration, source, tests and documentation. Extract it before use.
 - **`esphome-appliance.ign`**: the same generic live Ignition configuration as a standalone file for users of upstream CoreOS tooling.
-- **`SHA256SUMS`**: checksums for both files.
+- **`SHA256SUMS`**: checksums for all release assets.
 
-For a Fedora-triggered release, use the exact ISO URL in `fedora-base.json` or its release notes. Otherwise download the Fedora CoreOS **stable x86_64 Live DVD** separately from [Fedora](https://fedoraproject.org/coreos/download/) and verify Fedora’s checksum/signature. Our release package contains no Fedora image and needs no Fedora download during packaging. It uses generic defaults, including `SERIAL_CONSOLE=false`, and never reads a local `.env` or includes personal account settings or keys.
+For local builds, download the original Fedora CoreOS **stable x86_64 Live DVD** using the exact URL in `fedora-base.json` or the release notes, and verify Fedora’s checksum/signature. The small setup ZIP contains configuration and source; the bootable ISO is a separate release asset. It uses generic defaults, including `SERIAL_CONSOLE=false`, and never reads a local `.env` or includes personal account settings or keys.
 
 You can inspect the source and configuration, then use the portable builder below. Alternatively, use upstream `coreos-installer` to embed the supplied configuration:
 
@@ -26,21 +28,27 @@ coreos-installer iso ignition show esphome-appliance.iso
 
 The supplied file configures the **live installer**, including disk checks and account/GitHub prompts; it is not a configuration to attach directly to an installed Hyper-V/QEMU disk image. Ignition includes administrative provisioning scripts, so inspect the payload as well as verifying Fedora’s image. Upstream embedding/inspection commands are documented in [CoreOS installer](https://coreos.github.io/coreos-installer/cmd/iso/).
 
-## Automatic GitHub Releases
+## Automatic builds and GitHub Releases
 
-**No project tag is needed for Fedora updates.** The **Release setup package** workflow checks [Fedora’s stable stream metadata](https://builds.coreos.fedoraproject.org/streams/stable.json) every six hours, at 00:17, 06:17, 12:17 and 18:17 UTC. It selects the stable x86_64 Live DVD release. For a release without a complete published package, it runs normal/optimized tests on Windows/Linux with Python 3.11/3.13, verifies package checksums and automatically creates a GitHub Release/tag such as `fcos-44.20260913.3.2` at the source commit being built.
+The **Build and release appliance** workflow runs on pushes to any branch, project version tags such as `v1.0.0`, and a six-hour Fedora check at 00:17, 06:17, 12:17 and 18:17 UTC:
 
-Fedora-triggered releases also contain **`fedora-base.json`**, both standalone and inside the setup ZIP, recording the Fedora release, official ISO URL and checksum. `SHA256SUMS` covers the ZIP, Ignition and this manifest. The workflow downloads only stream metadata, not the Fedora ISO. A complete published release is skipped on later checks; draft or incomplete releases are retried using the original release’s source revision. New releases stay draft until asset uploads succeed. Automatic publication confirms source/package tests, not successful VM testing on each new Fedora release.
+- A push to any branch tests and builds the current source. Download the ISO and setup files from its Actions artifact; artifacts expire after seven days.
+- A pushed `v*` project tag tests and builds that tagged source. It publishes a GitHub Release only when the tag’s commit is reachable from `main`; tags on other branches produce build artifacts. Hyphenated project tags are prereleases.
+- The scheduled check reads [Fedora’s stable stream metadata](https://builds.coreos.fedoraproject.org/streams/stable.json). A new stable x86_64 Live DVD version produces a release such as `fcos-44.20260913.3.2`, built from the latest project version tag reachable from `main`. Version tags are ordered by Git’s version ordering; only tags whose commits are reachable from `main` are eligible. Until a project version tag exists, Fedora publication is skipped. Manual workflow dispatch runs the same Fedora check immediately.
 
-You can run the workflow manually to check immediately. Optional project version tags such as `v1.0.0` also publish a package for source changes without waiting for Fedora; hyphenated project tags are prereleases. These tag releases do not pin a Fedora manifest. Rerunning a tag workflow replaces its package assets.
+Every build runs normal/optimized tests on Windows/Linux with Python 3.13. It downloads or verifies a cached copy of the selected Fedora ISO, embeds the generic Ignition payload, verifies every byte outside the reserved Ignition area is unchanged, and checks all output checksums.
 
-The workflows must be committed at the repository root, including `.github/` and the dotfile templates. Scheduled runs use the default branch; GitHub may delay scheduled checks. The release job uses the repository’s `GITHUB_TOKEN` with `contents: write`; no personal token is needed. Repository or organization policy must permit that write permission. Installed guests retain their normal OS/container update behavior independently of these release checks.
+The ISO and its checksum accompany the small setup ZIP, standalone live Ignition, **`fedora-base.json`** and **`SHA256SUMS`**. The manifest records the exact Fedora release, original ISO URL and checksum, and is also included in the ZIP. `SHA256SUMS` covers all six assets. Release downloads remain available beyond the Actions artifact retention period. ISO filenames identify the exact Fedora version and source commit, for example `esphome-appliance-fcos-44.20260913.3.2-9701a46d0556.iso`; checksums use the same basename plus `.sha256`. Actions archive names also include the workflow run and attempt to distinguish builds.
 
-## Optional prebuilt ISO from GitHub Actions
+Published releases are immutable and skipped on reruns. Only drafts are retried, using their original source revision. New releases stay draft until all six uploads are verified. Corrections to a published release require a new version tag. Publishing confirms source/package tests and ISO verification; new Fedora versions still require guest runtime verification.
+
+Scheduled runs use the default branch and GitHub may delay them. The workflows and dotfile templates must be committed at the repository root. With a selective Actions allowlist, enable **Allow actions created by GitHub** for the SHA-pinned official actions. Publication uses the repository’s `GITHUB_TOKEN` with `contents: write`; repository or organization policy must permit that permission. Installed guests continue their normal OS and container update schedules independently.
+
+## Additional ISO builds from GitHub Actions
 
 Open **Actions > Build appliance ISO > Run workflow** for a convenience build. No username, key or platform inputs are required. The workflow must exist on the default branch for manual runs; users without repository write access can run it in their own forks.
 
-This workflow resolves Fedora’s current **stable x86_64 Live DVD** from [official stream metadata](https://builds.coreos.fedoraproject.org/streams/stable.json), caches and verifies the pristine ISO by SHA-256, runs normal/optimized tests and builds a generic installer with default settings. Download its artifact ZIP containing `esphome-appliance.iso` and its checksum, then **extract the ISO before mounting it**. These convenience artifacts expire after **seven days**. Automatic Fedora checks and project version tags publish small Release packages; they do not build or upload a Fedora-sized ISO.
+This workflow resolves Fedora’s current **stable x86_64 Live DVD** from [official stream metadata](https://builds.coreos.fedoraproject.org/streams/stable.json), caches and verifies the pristine ISO by SHA-256, runs normal/optimized tests and builds a generic installer with default settings. Download its artifact ZIP containing `esphome-appliance-fcos-<Fedora version>-<12-character source SHA>.iso` and its matching checksum, then **extract the ISO before mounting it**. These convenience artifacts expire after **seven days**. Automatic releases also include the bootable ISO, with permanent release downloads. The manual workflow is useful for an extra build without publishing a release.
 
 ## Build an installer locally
 
@@ -82,17 +90,17 @@ At the first ISO boot, the installer uses any account defaults embedded with `--
 1. **Linux system username**, if `USERNAME` is missing or empty: the key-login/passwordless-sudo account to create. Use a lowercase Linux account name; `root` and `core` are refused.
 2. **GitHub username**, if `SSH_KEY` is missing or empty: the account whose **all public SSH keys** should be authorized for that Linux user. You must hold at least one corresponding private key.
 
-When `SSH_KEY` is supplied, the installer uses that public key without a GitHub prompt or download. Otherwise it downloads `https://github.com/<username>.keys` over HTTPS and requires a successful, nonempty response. It imports the nonempty response lines without checking key types or validating individual keys with OpenSSH. Account setup completes before any disk is written. The GitHub path requires network connectivity, DNS and outbound HTTPS during live-ISO setup.
+When `SSH_KEY` is supplied, the installer uses that public key without a GitHub prompt or download. Otherwise it downloads `https://github.com/<username>.keys` over HTTPS and requires a successful, nonempty response. It authorizes the public keys in that response. Account setup completes before any disk is written. The GitHub path requires network connectivity, DNS and outbound HTTPS during live-ISO setup.
 
 The supplied public key, or all public keys downloaded from the chosen GitHub account, get administrative access through passwordless `wheel` sudo. Trust the chosen key/account. Downloaded keys are a snapshot taken at installation; changes to GitHub keys are not synchronized afterward. The live ISO has no initial SSH account. If console setup fails, correct the network/account input and reboot the installer; rebuild it if an embedded default needs correction; no disk installation has begun.
 
-Every installation uses the same configuration and adds no userspace VM guest-agent packages. Hyper-V heartbeat and graceful shutdown use the kernel’s native `hv_utils`; KVM/QEMU uses the standard ACPI power button and systemd-logind for graceful shutdown. Guest-agent IP reporting, metadata exchange, backup quiescing and file transfer are not provided. Find the guest’s address through DHCP/router records or the console. The live installer uses native `ConditionVirtualization=` conditions for Hyper-V, KVM and software QEMU. Software emulation is accepted and can be substantially slower than KVM.
+Every installation uses the same configuration. Hyper-V heartbeat and graceful shutdown use the kernel’s native integration; KVM/QEMU uses the standard ACPI power button and systemd-logind for graceful shutdown. Find the guest’s address through DHCP/router records or the console. The live installer uses native `ConditionVirtualization=` conditions for Hyper-V, KVM and software QEMU. Software emulation can be substantially slower than KVM.
 
 ## Create a Hyper-V VM
 
 1. Create a **Generation 2** VM with a new **64 GB** disk on SCSI, one DVD drive and a network adapter on a suitable virtual switch/VLAN. Allocate the CPUs/RAM you want the builder to use; an earlier Hyper-V setup used 16 CPUs and 10 GB RAM, while current isolated KVM tests use 4 CPUs and 4 GiB RAM. The appliance adds no CPU cap.
 2. While the VM is off, open **Settings > Security**, enable **Secure Boot**, and select **Microsoft UEFI Certificate Authority**, the Linux template. Keep the host's Secure Boot support up to date. See [Microsoft's Generation 2 security documentation](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/generation-2-virtual-machine-security-features).
-3. Under **Integration Services**, keep **Heartbeat** and **Operating system shutdown** enabled. Data Exchange is not needed; no KVP daemon is installed. The guest hostname is independent of the VM display name.
+3. Under **Integration Services**, keep **Heartbeat** and **Operating system shutdown** enabled.
 4. Under **Checkpoints**, clear **Enable checkpoints** unless you deliberately want them. If you enable them, choose the checkpoint policy appropriate for your backups; checkpoints are not a replacement for backups of pairing state. Automatic checkpoint creation is unnecessary for this appliance.
 5. Mount **only the customized installer ISO**. In **Firmware**, put the hard disk before the DVD. The fresh disk has no bootable OS, so the first boot uses the DVD. After installation, the disk boots first. Start the VM, answer any missing account prompts, then automatic disk verification/installation begins.
 6. On the installer's automatic reboot, eject the installer; leave the hard disk first. Booting the installer again hits the nonempty-disk guard; eject it and boot the disk.
@@ -102,13 +110,13 @@ Every installation uses the same configuration and adds no userspace VM guest-ag
 The common configuration is tested in an isolated QEMU/KVM VM. A real Proxmox installation and Secure Boot test are still required before claiming full Proxmox support.
 
 1. Create an x86_64 Linux VM using **OVMF (UEFI)** with an EFI disk, **VirtIO SCSI single**, one fresh **64 GB SCSI disk** and a VirtIO NIC on your bridge/VLAN. Choose CPU `host` when suitable for your migration requirements and allocate the desired cores/RAM. The installer discovers both SCSI and VirtIO Block disks. UEFI Secure Boot depends on the EFI disk's enrolled keys; validate the Fedora ISO with your chosen firmware/keys. It has not been tested here on Proxmox.
-2. Leave **QEMU Guest Agent** disabled in the VM’s options and keep **ACPI** enabled. Proxmox shutdown uses the ACPI power button; no guest agent is installed.
+2. Leave **QEMU Guest Agent** disabled in the VM’s options and keep **ACPI** enabled. Proxmox shutdown uses the ACPI power button.
 3. Mount the customized installer ISO and place the DVD first for installation.
 4. Start the VM and complete any missing account prompts. At the installer reboot, eject the ISO and put the installed disk first.
 
 For optional text console access after installation, build with `SERIAL_CONSOLE=true`. In Proxmox add a **Serial Port** (`serial0`) and select the serial console to get terminal copy/paste. Use the normal VM console for installation. The installation script embedded in Ignition passes standard `--console` options to `coreos-installer` for the installed disk. Kernel console arguments and systemd then provide the serial login; the VGA console remains enabled, and adding a serial device is optional.
 
-No CloudInit Drive is needed. CoreOS uses Ignition; account defaults and console/GitHub setup supply the account and keys. Networking follows CoreOS/NetworkManager defaults. No metadata or custom hypervisor-name discovery is used.
+CoreOS uses Ignition; account defaults and console/GitHub setup supply the account and keys. Networking follows CoreOS/NetworkManager defaults.
 
 ## First startup and hostname
 
@@ -120,9 +128,9 @@ Provisioning has three stages:
 
 Initial setup needs DNS and outbound HTTPS. Failures retry every 60 seconds without creating the completion marker; console login, SSH and the builder remain held. Progress/errors go to the console and journal, with systemd status output suppressed during setup and restored afterward. Use the VM console to diagnose setup failures.
 
-The permanent default hostname is **`esphome-builder-<12 hex characters>`**. Ignition writes `esphome-builder-????????????` to `/etc/hostname`; systemd expands the question marks using a cryptographic hash of `/etc/machine-id`. The same machine-id produces the same name across reboots, independent of the hypervisor, DHCP and VM display name. There is no hostname script, metadata mount, success marker or discovery retry. Cloning an installed disk without changing its machine-id preserves the same hostname. See [systemd hostname patterns](https://raw.githubusercontent.com/systemd/systemd/main/man/hostname.xml).
+The permanent default hostname is **`esphome-builder-<12 hex characters>`**. Ignition writes `esphome-builder-????????????` to `/etc/hostname`; systemd expands the question marks using a cryptographic hash of `/etc/machine-id`. The same machine-id produces the same name across reboots, independent of the hypervisor, DHCP and VM display name. Cloning an installed disk without changing its machine-id preserves the same hostname. See [systemd hostname patterns](https://raw.githubusercontent.com/systemd/systemd/main/man/hostname.xml).
 
-Networking requires address configuration, DNS, outbound HTTPS to Fedora repositories/container registries and NTP, plus TCP **22** for SSH administration, TCP **6055** from the main dashboard and multicast UDP **5353** if you use mDNS. Host networking enables local-link discovery; VLAN boundaries require an mDNS reflector or manual pairing. Proxmox cloud-init network settings are not consumed; the appliance uses CoreOS/NetworkManager network defaults. No special IPv6-only configuration or testing is part of this project.
+Networking requires address configuration, DNS, outbound HTTPS to Fedora repositories/container registries and NTP, plus TCP **22** for SSH administration, TCP **6055** from the main dashboard and multicast UDP **5353** if you use mDNS. Host networking enables local-link discovery; VLAN boundaries require an mDNS reflector or manual pairing. Proxmox cloud-init network settings are not consumed; the appliance uses CoreOS/NetworkManager network defaults.
 
 
 ## Pair and operate
@@ -154,7 +162,7 @@ chronyc sources -v
 ## Updates and persistence
 
 - ESPHome uses `ghcr.io/esphome/esphome:stable`, `AutoUpdate=registry` and the native Podman updater. The first installed boot pulls the current stable image before the setup reboot; later boots use the cached image. The updater timer starts after the builder, checks three minutes after activation and daily at **03:00 UTC**. A missed daily check can run immediately on timer activation because `Persistent=true`. Updates restart the container and can interrupt a build.
-- Zincati automatically stages CoreOS updates and allows update reboots **04:00–05:00 UTC daily**. Its periodic window controls reboots, not a mandatory daily reboot or an OS-update check on every boot. Layered packages carry forward into OS updates. No `dnf-automatic` is used. [Zincati strategies](https://coreos.github.io/zincati/usage/updates-strategy/).
+- Zincati automatically stages CoreOS updates and allows update reboots **04:00–05:00 UTC daily**. Its periodic window controls reboots, not a mandatory daily reboot or an OS-update check on every boot. Layered packages carry forward into OS updates. [Zincati strategies](https://coreos.github.io/zincati/usage/updates-strategy/).
 - All VM CPUs are available. Console keyboard is **US** and timezone **UTC**. NTP pools are configurable in `.env`; there is no forced source priority.
 - Quadlet creates/operates the rootful container with `Network=host`. Persistent config, builds and caches live under `/var/lib/esphome/{config,build,cache,ccache}` with SELinux container relabeling. `/var/tmp/esphome` supplies temporary container files; standard tmpfiles cleanup removes unused/unchanged files after seven days. Persistent caches have no automatic age-based deletion.
 - Tmpfiles creates directories and restores SELinux policy labels on the timezone symlink before normal services start. The package-completion marker uses a separate tmpfiles configuration outside `tmpfiles.d`, so normal boot processing cannot create it prematurely. SELinux stays enforcing.
@@ -164,12 +172,6 @@ chronyc sources -v
 
 Changes to build defaults or Ignition affect newly installed guests only. To change an installed Quadlet, reload systemd and restart the builder. Its `[Install]` section is handled by the generator; do not enable the generated service directly. [Quadlet documentation](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html).
 
-## Minimal service policy
-
-The appliance uses local passwd accounts, local disks and Podman. Ignition masks `systemd-homed.service`, `systemd-homed-activate.service` and `gssproxy.service`; it disables automatic `fwupd-refresh.timer`, `raid-check.timer` and `docker.socket`. Base packages stay installed, avoiding rpm-ostree base-removal overrides. Debugging tools remain available. Existing guests need an explicit configuration change; a rebuilt ISO does not update their unit policy.
-
-CoreOS networking/DNS, SSH/login, logging/auditing, authorization, device management, namespace/user lookup, OS updates and timekeeping retain their normal services. Completed boot oneshots and socket-activated services are not all continuously running daemons. The weekly dangling-image cleanup and native update/tmpfiles timers remain useful housekeeping.
-
 ## Development and release status
 
 ```sh
@@ -177,8 +179,8 @@ python -m unittest discover -s tests -v
 python -O -m unittest discover -s tests -v
 ```
 
-The test suite covers ISO encoding/verification, malformed inputs, no-overwrite safeguards, failure cleanup, settings, native hypervisor conditions and generated startup ordering. CI runs the same tests on Windows/Linux with Python 3.11/3.13. Real systemd, SELinux, hypervisor integration, Secure Boot, connectivity and firmware builds require VM testing. Build verification is not a claim of successful installation.
+The test suite covers ISO encoding/verification, malformed inputs, no-overwrite safeguards, failure cleanup, settings, native hypervisor conditions and generated startup ordering. CI runs the same tests on Windows/Linux with Python 3.13, checks build/release policy using real Git ancestry fixtures, and lints workflow syntax. ISO builds also verify a serial-enabled installer against the original Fedora image. Real systemd, SELinux, hypervisor integration, Secure Boot, connectivity and firmware builds require VM testing. Build verification is not a claim of successful installation.
 
-The original Hyper-V implementation installed and built firmware successfully, including the console ordering and SELinux label fix. QEMU/KVM tests have verified installation, package staging/reboot, builder readiness, stored builder identity across reboot. A fresh installation verified machine-id hostnames, installed UEFI serial output/login, initial update checking, package staging, image pull, the setup reboot and gated SSH/builder startup. A subsequent service audit removed both agent layers, verified the minimal unit policy with zero failed services and confirmed graceful ACPI poweroff. No newer CoreOS release was available during that check; activation of a newer release, installed BIOS serial boot, Hyper-V and actual Proxmox still need current runtime verification. Remaining runtime and workflow checks are tracked in [RELEASING.md](RELEASING.md). Treat this source as a release candidate until those checks pass.
+The original Hyper-V implementation installed and built firmware successfully, including the console ordering and SELinux label fix. QEMU/KVM tests have verified installation, package staging/reboot, builder readiness, stored builder identity across reboot. A fresh installation verified machine-id hostnames, installed UEFI serial output/login, initial update checking, package staging, image pull, the setup reboot and gated SSH/builder startup. A subsequent service audit verified zero failed services and graceful ACPI poweroff. No newer CoreOS release was available during that check; activation of a newer release, installed BIOS serial boot, Hyper-V and actual Proxmox still need current runtime verification. Treat this source as a release candidate until those checks pass.
 
 This source uses the **MIT license**. Fedora CoreOS, ESPHome and bundled guest software retain their own licenses. The builder modifies only the documented reserved Ignition area. Every byte outside that area is verified unchanged against the source ISO, for all settings. Optional serial configuration is carried inside Ignition and applied to the installed disk; it never changes the live ISO’s boot files or arguments. [CoreOS ISO embedding format](https://coreos.github.io/coreos-installer/iso-embed-ignition/).
