@@ -1,0 +1,42 @@
+
+ESPHome remote build appliance
+
+This machine compiles firmware for your main ESPHome dashboard.
+Hostname: esphome-builder-<12 hex characters>, derived from /etc/machine-id.
+The default name stays the same across reboots.
+SSH user: @USERNAME@ (key login, passwordless sudo). Builder port: TCP 6055.
+Passwordless sudo is granted through the wheel group.
+
+Pair from main dashboard: Settings > Send builds > Pair with a build server.
+Use this VM's IP, port 6055, and the fingerprint/key in the builder log.
+
+Status:       sudo systemctl status esphome-builder zincati
+Pairing/logs: sudo journalctl -u esphome-builder -n 100 --no-pager
+Follow logs:  sudo journalctl -u esphome-builder -f
+Update now:   sudo systemctl start podman-auto-update.service
+Update logs:  sudo journalctl -u podman-auto-update.service -n 50 --no-pager
+Restart:      sudo systemctl restart esphome-builder.service
+Timers:       systemctl list-timers podman-auto-update.timer
+Disk space:   df -h /var
+
+ESPHome stable: native Podman updates at 03:00 UTC and 3 min after timer start.
+The update timer starts after the builder; missed daily checks run on startup.
+Container updates restart the builder and can interrupt an active compile.
+CoreOS: Zincati stages OS updates; update reboots allowed 04:00-05:00 daily.
+An OS reboot or manual restart can interrupt builds. No dnf-automatic needed.
+
+Persistent pairing, build files and caches: /var/lib/esphome/{config,build,cache,ccache}
+Container: esphome-builder. Uses all VM CPUs; allocate CPUs in the hypervisor.
+Managed by Quadlet: /etc/containers/systemd/esphome-builder.container
+After editing Quadlet: sudo systemctl daemon-reload, then restart the builder.
+Console keyboard: US. Timezone: UTC.
+Chrony pools: @NTP_POOLS@ (no forced priority).
+Time status: timedatectl ; chronyc sources -v
+Tools: htop, btop, vim, tmux, jq, dig, tcpdump, ethtool, traceroute, strings.
+Keep config/ to preserve identity and pairing. Caches consume disk over time.
+Tmpfiles creates data directories and cleans temporary build files after 7d.
+Weekly dangling-image cleanup; journal retention 14d / 256 MB.
+Network needs access to the main dashboard and outbound internet (HTTPS/DNS).
+
+Ignition runs only on first boot. Changes to an installation ISO/config do
+not change this running VM. Do not boot an installer to update the appliance.

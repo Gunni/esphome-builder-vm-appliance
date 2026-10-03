@@ -1,0 +1,116 @@
+name: Release setup package
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.detect.outputs.publish }}
+      tag: ${{ steps.detect.outputs.tag }}
+      selection: ${{ steps.detect.outputs.selection }}
+      source: ${{ steps.detect.outputs.source }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Detect new Fedora stable release
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          printf 'source=%s\n' "$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT_NAME" == push ]]; then
+            printf 'tag=%s\npublish=true\n' "$REF_NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python .download-coreos.py prepare .ci
+          tag="fcos-$(python -c "import json; print(json.load(open('.ci/selection.json'))['release'])")"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          python -c "import json, os; data=json.load(open('.ci/selection.json')); open(os.environ['GITHUB_OUTPUT'], 'a').write('selection='+json.dumps(data)+'\n')"
+          if gh release view "$tag" --json isDraft,assets,targetCommitish > .ci/existing-release.json 2>/dev/null; then
+            if python -c "import json,sys; r=json.load(open('.ci/existing-release.json')); expected={'esphome-appliance.ign','esphome-appliance-setup.zip','fedora-base.json','SHA256SUMS'}; sys.exit(0 if not r['isDraft'] and expected <= {a['name'] for a in r['assets']} else 1)"; then
+              printf 'publish=false\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            python -c "import json,os; r=json.load(open('.ci/existing-release.json')); open(os.environ['GITHUB_OUTPUT'], 'a').write('source='+r['targetCommitish']+'\n')"
+          fi
+          printf 'publish=true\n' >> "$GITHUB_OUTPUT"
+  tests:
+    needs: detect
+    if: needs.detect.outputs.publish == 'true'
+    uses: ./.github/workflows/test.yml
+    with:
+      ref: ${{ needs.detect.outputs.source }}
+  release:
+    needs: [detect, tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.detect.outputs.source }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Package generic configuration and source
+        env:
+          FEDORA_SELECTION: ${{ needs.detect.outputs.selection }}
+        shell: bash
+        run: |
+          if [[ -n "$FEDORA_SELECTION" ]]; then
+            python -c "import os; from pathlib import Path; Path('.ci').mkdir(exist_ok=True); Path('.ci/selection.json').write_text(os.environ['FEDORA_SELECTION'])"
+            python build-release.py build/release --fedora-selection .ci/selection.json
+          else
+            python build-release.py build/release
+          fi
+      - name: Verify package checksums
+        working-directory: build/release
+        run: sha256sum --check SHA256SUMS
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.detect.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.detect.outputs.source }}
+          FEDORA_SELECTION: ${{ needs.detect.outputs.selection }}
+        shell: bash
+        run: |
+          assets=(build/release/esphome-appliance.ign build/release/esphome-appliance-setup.zip build/release/SHA256SUMS)
+          if [[ -n "$FEDORA_SELECTION" ]]; then
+            assets+=(build/release/fedora-base.json)
+            python -c "import json,os; from pathlib import Path; f=json.loads(os.environ['FEDORA_SELECTION']); Path('build/release-notes.md').write_text('Setup package for Fedora CoreOS stable '+f['release']+'.\n\nDownload the original x86_64 Live DVD from Fedora:\n'+f['location']+'\n\nFedora ISO SHA-256: '+f['sha256']+'\n\nSource commit: '+os.environ['RELEASE_COMMIT']+'\n\nThis release contains configuration/source only. The test suite passed; publishing does not claim VM runtime validation of this new Fedora release. Follow the included README to verify Fedora and build locally.\n')"
+            title="ESPHome setup for Fedora CoreOS ${RELEASE_TAG#fcos-}"
+            options=(--target "$RELEASE_COMMIT" --notes-file build/release-notes.md --title "$title")
+          else
+            options=(--verify-tag --generate-notes --title "$RELEASE_TAG")
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              options+=(--prerelease)
+            fi
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" --draft "${assets[@]}" "${options[@]}"
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false

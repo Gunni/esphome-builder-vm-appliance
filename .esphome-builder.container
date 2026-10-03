@@ -1,0 +1,31 @@
+[Unit]
+Description=ESPHome dedicated remote builder
+Wants=network-online.target
+Requires=esphome-tools.service
+After=network-online.target systemd-tmpfiles-setup.service esphome-tools.service
+StartLimitIntervalSec=0
+
+[Container]
+Image=ghcr.io/esphome/esphome:stable
+ContainerName=esphome-builder
+Network=host
+Pull=missing
+AutoUpdate=registry
+Exec=dashboard /config --remote-build-only
+Environment=CCACHE_DIR=/ccache
+Environment=PYTHONUNBUFFERED=1
+Volume=/var/lib/esphome/config:/config:Z
+Volume=/var/lib/esphome/cache:/cache:Z
+Volume=/var/lib/esphome/build:/build:Z
+Volume=/var/lib/esphome/ccache:/ccache:Z
+Volume=/var/tmp/esphome:/tmp:Z
+StopTimeout=60
+
+[Service]
+Restart=always
+RestartSec=30
+TimeoutStartSec=0
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

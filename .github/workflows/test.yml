@@ -1,0 +1,35 @@
+name: Tests
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Source revision to validate for a release
+        type: string
+        required: false
+        default: ''
+  push:
+    branches: ['**']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Test
+        run: python -m unittest discover -s tests -v
+      - name: Test with optimization
+        run: python -O -m unittest discover -s tests -v

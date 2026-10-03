@@ -1,0 +1,47 @@
+name: Build appliance ISO
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Test the builder
+        run: python -m unittest discover -s tests -v
+      - name: Test with optimization
+        run: python -O -m unittest discover -s tests -v
+      - name: Resolve latest stable Fedora ISO
+        id: fedora
+        run: python .download-coreos.py prepare .ci --github-output "$GITHUB_OUTPUT"
+      - name: Cache unmodified Fedora ISO
+        uses: actions/cache@v6
+        with:
+          path: .ci/base.iso
+          key: fedora-coreos-stable-x86_64-iso-${{ steps.fedora.outputs.sha256 }}
+      - name: Download or verify cached Fedora ISO
+        run: python .download-coreos.py fetch .ci
+      - name: Build customized ISO
+        run: |
+          python -c "from pathlib import Path; Path('build').mkdir(exist_ok=True)"
+          python build-installer.py .ci/base.iso build/esphome-appliance.iso
+      - name: Verify artifact checksum
+        working-directory: build
+        run: sha256sum --check esphome-appliance.iso.sha256
+      - name: Upload installer and checksum
+        uses: actions/upload-artifact@v7
+        with:
+          name: esphome-appliance-${{ steps.fedora.outputs.release }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/esphome-appliance.iso
+            build/esphome-appliance.iso.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

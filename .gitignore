@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+*.pub
+*.pem
+*.key
+*.iso
+*.iso.sha256
+*.ign
+*.zip
+__pycache__/
+*.py[cod]
+build/
+
+.ci/
