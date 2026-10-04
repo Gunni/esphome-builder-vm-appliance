@@ -39,7 +39,10 @@ jobs:
       - name: Check build and publication policy
         if: runner.os == 'Linux'
         run: |
-          command -v bash jq git
+          command -v bash jq git node
+          test -f /usr/share/bash-completion/bash_completion
+          test -f /usr/share/bash-completion/completions/journalctl
+          test -f /usr/share/bash-completion/completions/systemctl
           python tests/check_workflow.py
       - name: Lint GitHub workflows
         if: runner.os == 'Linux'

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-D = runpy.run_path(str(Path(__file__).resolve().parents[1] / ".download-coreos.py"))
+D = runpy.run_path(str(Path(__file__).resolve().parents[1] / "download-coreos.py"))
 
 
 class DownloadTests(unittest.TestCase):

@@ -39,6 +39,37 @@ CHRONY = ("# Global NTP pools. Chrony selects sources based on measured quality.
     logdir /var/log/chrony
 """).lstrip("\n"))
 
+ESPHOME_SHELL = dedent(r"""
+    #!/usr/bin/bash
+    set -euo pipefail
+    if [ "$(id -un)" != esphome ]; then
+        exec /usr/bin/run0 -u esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/local/bin/esphome-shell
+    fi
+    exec /usr/bin/podman exec --interactive --tty --workdir /config esphome-builder /bin/bash -c '
+        while IFS= read -r -d "" setting; do
+            export "$setting"
+        done < /proc/1/environ
+        exec /bin/bash --noprofile --norc
+    '
+""").lstrip("\n")
+
+DISABLE_AUTOLOGIN = dedent(r"""
+    #!/usr/bin/bash
+    set -euo pipefail
+    /usr/bin/rm -f -- /etc/systemd/system/{getty@,serial-getty@}.service.d/autologin.conf
+    /usr/bin/systemctl daemon-reload
+    /usr/bin/rm -f -- /usr/local/bin/esphome-disable-autologin
+""").lstrip("\n")
+
+# Thin wrappers keep the correct journal filters and user-manager scope in one place.
+ESPHOME_COMMANDS = {
+    'esphome-logs': '/usr/bin/run0 /usr/bin/journalctl _UID=2000 _SYSTEMD_USER_UNIT=esphome-builder.service',
+    **{f'esphome-{verb}': '/usr/bin/run0 -u esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/bin/systemctl --user ' + verb + ' esphome-builder.service'
+       for verb in ('start', 'stop', 'restart', 'status')},
+    'esphome-update': '/usr/bin/run0 -u esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/bin/systemctl --user start podman-auto-update.service',
+    'esphome-timers': '/usr/bin/run0 -u esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/bin/systemctl --user list-timers podman-auto-update.timer esphome-image-clean.timer',
+}
+
 INSTALL = dedent(r"""
     #!/usr/bin/bash
     set -euo pipefail
@@ -68,9 +99,6 @@ INSTALL = dedent(r"""
     [[ "$mounts" =~ ^[[:space:]]*$ ]] || refuse "$disk is mounted or used as swap"
     signatures=$(wipefs --no-act --noheadings --output TYPE "$disk")
     [ -z "$signatures" ] || refuse "$disk has a filesystem, partition-table or RAID signature"
-    echo "Selected $disk ($bytes bytes). Verifying the entire disk is zero-filled; this may take a while."
-    command -v cmp >/dev/null || refuse 'cmp is unavailable; cannot verify the disk is empty'
-    cmp --silent --bytes="$bytes" "$disk" /dev/zero || refuse "$disk contains data or could not be fully read"
     # Recheck topology/signatures immediately before the destructive operation.
     nodes=$(lsblk --noheadings --raw --paths --output NAME "$disk")
     signatures=$(wipefs --no-act --noheadings --output TYPE "$disk")
@@ -80,7 +108,7 @@ INSTALL = dedent(r"""
     [ -z "$signatures" ] || refuse 'disk signatures changed'
     [[ "$mounts" =~ ^[[:space:]]*$ ]] || refuse 'disk became mounted'
     [ "$current_bytes" = "$bytes" ] || refuse 'disk size changed'
-    echo "Verified empty disk: $disk. Installing Fedora CoreOS."
+    echo "Disk checks passed: $disk ($bytes bytes). Installing Fedora CoreOS."
     coreos-installer install "$disk" --offline --ignition-file /run/esphome/installed.ign
     echo 'Installation complete. Eject installer ISO; systemd will reboot.'
 """).lstrip("\n")
@@ -95,21 +123,80 @@ def configs(ssh_key, username, ntp_pools=None):
         'passwd': {'users': [
             {'name': 'core', 'shouldExist': False},
             {'name': username, 'groups': ['wheel'], 'shell': '/bin/bash', 'sshAuthorizedKeys': [ssh_key]},
+            {'name': 'esphome', 'uid': 2000, 'homeDir': '/var/home/esphome',
+             'shell': '/usr/sbin/nologin', 'system': True},
         ]},
         'storage': {'links': [
             {'path': '/etc/localtime', 'target': '/usr/share/zoneinfo/UTC', 'overwrite': True},
+        ] + [
+            {'path': '/var/home/esphome/.config/systemd/user/timers.target.wants/' + name,
+             'target': target}
+            for name, target in (
+                ('podman-auto-update.timer', '/usr/lib/systemd/user/podman-auto-update.timer'),
+                ('esphome-image-clean.timer', '../esphome-image-clean.timer'))
+        ], 'directories': [
+            {'path': '/var/home/esphome', 'mode': 0o700, 'user': {'name': 'esphome'}, 'group': {'name': 'esphome'}},
+            {'path': '/var/home/esphome/.config/systemd/user', 'mode': 0o755,
+             'user': {'name': 'esphome'}, 'group': {'name': 'esphome'}},
         ], 'files': [
+            file('/etc/esphome-appliance-release', 'NAME="ESPHome appliance"\nID=esphome-appliance\nVARIANT="Remote builder"\nVARIANT_ID=remote-builder\n'),
+            file('/var/lib/systemd/linger/esphome', ''),
+            {'path': '/etc/subuid', 'append': [{'source': file('', 'esphome:524288:65536\n')['contents']['source']}]},
+            {'path': '/etc/subgid', 'append': [{'source': file('', 'esphome:524288:65536\n')['contents']['source']}]},
             file('/etc/hostname', 'esphome-builder-????????????\n', overwrite=True),
             file('/etc/vconsole.conf', 'KEYMAP=us\n', overwrite=True),
             file('/etc/chrony.conf', chrony, overwrite=True),
-            file('/etc/motd.d/20-esphome-appliance', (HERE / '.motd.txt').read_text(encoding='utf-8').replace('@USERNAME@', username).replace('@NTP_POOLS@', ' '.join(ntp_pools or DEFAULT_NTP_POOLS))),
-            file('/etc/containers/systemd/esphome-builder.container', (HERE / '.esphome-builder.container').read_text(encoding='utf-8')),
-            file('/etc/tmpfiles.d/esphome-appliance.conf', (HERE / '.esphome-tmpfiles.conf').read_text(encoding='utf-8')),
+            file('/etc/motd.d/20-esphome-appliance', (HERE / 'motd.txt').read_text(encoding='utf-8').replace('@USERNAME@', username).replace('@NTP_POOLS@', ' '.join(ntp_pools or DEFAULT_NTP_POOLS))),
+            file('/etc/bash_completion.d/esphome-appliance', (HERE / 'esphome-completion.bash').read_text(encoding='utf-8')),
+            file('/usr/local/bin/esphome-shell', ESPHOME_SHELL, mode=0o755),
+            file('/usr/local/bin/esphome-disable-autologin', DISABLE_AUTOLOGIN, mode=0o755),
+            *[file('/usr/local/bin/' + name, '#!/usr/bin/bash\nexec ' + command + ' "$@"\n', mode=0o755)
+              for name, command in ESPHOME_COMMANDS.items()],
+            file('/etc/containers/systemd/users/2000/esphome-builder.container', (HERE / 'esphome-builder.container').read_text(encoding='utf-8')),
+            file('/var/home/esphome/.config/systemd/user/esphome-image-clean.service', dedent(r"""
+                [Unit]
+                Description=Remove unused dangling container images
+                After=podman-auto-update.service
+                [Service]
+                Type=oneshot
+                ExecStart=/usr/bin/podman image prune --force
+            """).lstrip("\n")),
+            file('/var/home/esphome/.config/systemd/user/esphome-image-clean.timer', dedent(r"""
+                [Unit]
+                ConditionPathExists=/var/lib/esphome/.packages-layered
+                Description=Weekly unused container image cleanup
+                [Timer]
+                OnCalendar=Sun *-*-* 05:30:00 UTC
+                Persistent=true
+                [Install]
+                WantedBy=timers.target
+            """).lstrip("\n")),
+            file('/var/home/esphome/.config/systemd/user/podman-auto-update.timer.d/10-appliance-schedule.conf', dedent(r"""
+                [Unit]
+                ConditionPathExists=/var/lib/esphome/.packages-layered
+                Wants=esphome-builder.service
+                After=esphome-builder.service
+                [Timer]
+                OnCalendar=
+                OnCalendar=*-*-* 03:00:00 UTC
+                OnActiveSec=3min
+                RandomizedDelaySec=0
+                Persistent=true
+            """).lstrip("\n")),
+            file('/etc/tmpfiles.d/esphome-appliance.conf', (HERE / 'esphome-tmpfiles.conf').read_text(encoding='utf-8')),
             # Success markers must not be created by normal boot tmpfiles processing.
             file('/etc/esphome-appliance/packages-complete.conf', 'f /var/lib/esphome/.packages-layered 0644 root root - -\n'),
             file('/etc/systemd/journald.conf.d/50-appliance-limits.conf', '[Journal]\nSystemMaxUse=256M\nRuntimeMaxUse=64M\nMaxRetentionSec=14day\n'),
             file('/etc/ssh/sshd_config.d/20-key-only.conf', 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n'),
-            file('/etc/sudoers.d/90-wheel', '%wheel ALL=(ALL) NOPASSWD: ALL\n', 0o440),
+            file('/etc/polkit-1/rules.d/10-esphome-run0.rules', dedent(r"""
+                // Admin access from both console and SSH sessions.
+                polkit.addRule(function(action, subject) {
+                    if (action.id === "org.freedesktop.systemd1.manage-units" &&
+                        subject.isInGroup("wheel")) {
+                        return polkit.Result.YES;
+                    }
+                });
+            """).lstrip("\n")),
             file('/etc/zincati/config.d/55-updates.toml', dedent(r"""
                 [updates]
                 enabled = true
@@ -127,16 +214,17 @@ def configs(ssh_key, username, ntp_pools=None):
                 [Unit]
                 Description=Update appliance OS, layer tools and prepare ESPHome
                 Wants=network-online.target getty-pre.target
-                After=network-online.target systemd-tmpfiles-setup.service
-                Before=multi-user.target getty-pre.target sshd.service zincati.service esphome-builder.service
+                Requires=user@2000.service
+                After=network-online.target systemd-tmpfiles-setup.service user@2000.service
+                Before=multi-user.target getty-pre.target sshd.service zincati.service
                 ConditionPathExists=!/var/lib/esphome/.packages-layered
                 SuccessAction=reboot
                 [Service]
                 Type=oneshot
                 ExecStartPre=/usr/bin/busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager SetShowStatus s no
-                ExecStart=/usr/bin/rpm-ostree upgrade --bypass-driver
-                ExecStart=/usr/bin/rpm-ostree install --idempotent --allow-inactive binutils htop btop vim-enhanced tmux jq bind-utils tcpdump ethtool traceroute
-                ExecStart=/usr/bin/podman pull ghcr.io/esphome/esphome:stable
+                ExecStart=-/usr/bin/rpm-ostree upgrade --bypass-driver
+                ExecStart=/usr/bin/rpm-ostree install --idempotent --allow-inactive binutils bash-completion htop btop vim-enhanced tmux jq bind-utils tcpdump ethtool traceroute
+                ExecStart=/usr/bin/systemd-run --unit=esphome-image-pull --wait --pipe --collect --uid=esphome --setenv=HOME=/var/home/esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/bin/podman pull ghcr.io/esphome/esphome:stable
                 ExecStopPost=/usr/bin/busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager SetShowStatus s ""
                 StandardOutput=journal+console
                 StandardError=journal+console
@@ -148,6 +236,12 @@ def configs(ssh_key, username, ntp_pools=None):
                 [Install]
                 WantedBy=multi-user.target
             """).lstrip("\n")),
+        ] + [
+            # agetty consumes this native credential; Fedora keeps its getty commands.
+            {'name': name, 'dropins': [{'name': 'autologin.conf',
+                'contents': '[Service]\nSetCredential=agetty.autologin:' + username + '\n'}]}
+            for name in ('getty@.service', 'serial-getty@.service')
+        ] + [
             # Local passwd accounts, local disks and Podman need none of these.
             {'name': 'systemd-homed.service', 'enabled': False, 'mask': True},
             {'name': 'systemd-homed-activate.service', 'enabled': False, 'mask': True},
@@ -157,36 +251,6 @@ def configs(ssh_key, username, ntp_pools=None):
             {'name': 'docker.socket', 'enabled': False},
             {'name': 'chronyd.service', 'enabled': True},
             {'name': 'systemd-tmpfiles-clean.timer', 'enabled': True},
-            {'name': 'esphome-image-clean.service', 'contents': dedent(r"""
-                [Unit]
-                Description=Remove unused dangling container images
-                After=podman-auto-update.service
-                [Service]
-                Type=oneshot
-                ExecStart=/usr/bin/podman image prune --force
-            """).lstrip("\n")},
-            unit('esphome-image-clean.timer', dedent(r"""
-                [Unit]
-                Description=Weekly unused container image cleanup
-                [Timer]
-                OnCalendar=Sun *-*-* 05:30:00 UTC
-                Persistent=true
-                [Install]
-                WantedBy=timers.target
-            """).lstrip("\n")),
-            {'name': 'podman-auto-update.timer', 'enabled': True, 'dropins': [
-                {'name': '10-appliance-schedule.conf', 'contents': dedent(r"""
-                    [Unit]
-                    Wants=esphome-builder.service
-                    After=esphome-builder.service
-                    [Timer]
-                    OnCalendar=
-                    OnCalendar=*-*-* 03:00:00 UTC
-                    OnActiveSec=3min
-                    RandomizedDelaySec=0
-                    Persistent=true
-                """).lstrip("\n")}
-            ]},
         ]}
     }
     return dest
@@ -206,18 +270,22 @@ PROVISION = dedent(r"""
         read -r username
     fi
     [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || refuse 'invalid Linux username'
-    [[ "$username" != root && "$username" != core ]] || refuse 'choose a username other than root or core'
+    [[ "$username" != root && "$username" != core && "$username" != esphome ]] || refuse 'choose a username other than root, core or esphome'
     jq -j '.ssh_key' "$defaults" > /run/esphome/github.keys
     if [ ! -s /run/esphome/github.keys ]; then
-        printf 'GitHub username (all SSH public keys on that account will be authorized): '
+        printf 'GitHub username (all SSH public keys; Enter to skip SSH setup): '
         read -r github_username
-        [[ "$github_username" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$ ]] || refuse 'invalid GitHub username'
-        [[ "$github_username" != *--* ]] || refuse 'invalid GitHub username'
-        echo "Downloading SSH public keys for $github_username..."
-        curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-            --connect-timeout 15 --max-time 60 --retry 3 \
-            "https://github.com/$github_username.keys" --output /run/esphome/github.keys
-        [ -s /run/esphome/github.keys ] || refuse 'this GitHub account has no SSH public keys'
+        if [ -n "$github_username" ]; then
+            [[ "$github_username" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$ ]] || refuse 'invalid GitHub username'
+            [[ "$github_username" != *--* ]] || refuse 'invalid GitHub username'
+            echo "Downloading SSH public keys for $github_username..."
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+                --connect-timeout 15 --max-time 60 --retry 3 \
+                "https://github.com/$github_username.keys" --output /run/esphome/github.keys
+            [ -s /run/esphome/github.keys ] || refuse 'this GitHub account has no SSH public keys'
+        else
+            echo 'Skipping SSH keys. Use console autologin to access the appliance.'
+        fi
     else
         echo 'Using public SSH key supplied at build time.'
     fi
@@ -226,8 +294,10 @@ PROVISION = dedent(r"""
     motd=$(printf '%s' "${motd#data:;base64,}" | base64 -d | sed "s/@USERNAME@/$username/g" | base64 -w0)
     umask 077
     jq --arg user "$username" --rawfile keys /run/esphome/github.keys --arg motd "$motd" '
-        .passwd.users |= map(if .shouldExist == false then . else
+        .passwd.users |= map(if .name != "@USERNAME@" then . else
             .name = $user | .sshAuthorizedKeys = ($keys | split("\n") | map(select(length > 0))) end)
+        | .systemd.units |= map(if .name == "getty@.service" or .name == "serial-getty@.service" then
+            .dropins |= map(.contents |= gsub("@USERNAME@"; $user)) else . end)
         | .storage.files |= map(if .path == "/etc/motd.d/20-esphome-appliance" then
             .contents.source = ("data:;base64," + $motd) else . end)
     ' "$template" > /run/esphome/installed.ign
@@ -453,7 +523,7 @@ def read_settings(path):
             'NTP_POOLS must be a space-separated list of NTP hostnames or IPv4 addresses')
     username = result.get('USERNAME', '')
     require(not username or (re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', username)
-                            and username not in {'root', 'core'}), 'Invalid USERNAME')
+                            and username not in {'root', 'core', 'esphome'}), 'Invalid USERNAME')
     serial = result.get('SERIAL_CONSOLE', 'false').lower()
     require(serial in {'true', 'false'}, 'SERIAL_CONSOLE must be true or false')
     return dict(min_disk_gib=minimum, max_disk_gib=maximum, ntp_pools=pools,

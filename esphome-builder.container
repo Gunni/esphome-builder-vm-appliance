@@ -1,8 +1,6 @@
 [Unit]
 Description=ESPHome dedicated remote builder
-Wants=network-online.target
-Requires=esphome-tools.service
-After=network-online.target systemd-tmpfiles-setup.service esphome-tools.service
+ConditionPathExists=/var/lib/esphome/.packages-layered
 StartLimitIntervalSec=0
 
 [Container]
@@ -28,4 +26,4 @@ TimeoutStartSec=0
 TimeoutStopSec=90
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

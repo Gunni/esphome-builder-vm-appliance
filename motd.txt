@@ -1,0 +1,21 @@
+ESPHome remote builder — port 6055
+Management user: @USERNAME@ (console autologin, passwordless run0).
+Pair from your main dashboard: Settings > Send builds > Pair with a build server.
+
+  esphome-status                 Builder status
+  esphome-logs -n 100 --no-pager  Pairing details and recent logs
+  esphome-logs -f                 Follow logs; journalctl arguments accepted
+  esphome-start / esphome-stop    Start / stop builder
+  esphome-restart                 Restart builder
+  esphome-shell                   Container shell with shared build/cache paths
+  esphome-update                  Check for a container update
+  esphome-timers                  Update and cleanup schedules
+  run0 journalctl -u esphome-tools -b  Initial setup logs
+
+Back up /var/lib/esphome/config to preserve pairing.
+Container updates: 03:00 UTC. OS update reboots: 04:00–05:00 UTC.
+Updates and restarts can interrupt builds.
+
+Disable console autologin: set a password first with run0 passwd @USERNAME@,
+then run (takes effect at the next console login):
+run0 esphome-disable-autologin

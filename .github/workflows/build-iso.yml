@@ -24,14 +24,14 @@ jobs:
         run: python -O -m unittest discover -s tests -v
       - name: Resolve latest stable Fedora ISO
         id: fedora
-        run: python .download-coreos.py prepare .ci --github-output "$GITHUB_OUTPUT"
+        run: python download-coreos.py prepare .ci --github-output "$GITHUB_OUTPUT"
       - name: Cache unmodified Fedora ISO
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ci/base.iso
           key: fedora-coreos-stable-x86_64-iso-${{ steps.fedora.outputs.sha256 }}
       - name: Download or verify cached Fedora ISO
-        run: python .download-coreos.py fetch .ci
+        run: python download-coreos.py fetch .ci
       - name: Build customized ISO
         run: |
           python -c "from pathlib import Path; Path('build').mkdir(exist_ok=True)"

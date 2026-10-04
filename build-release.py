@@ -10,8 +10,8 @@ HERE = Path(__file__).resolve().parent
 # Explicit allowlist: never package .env, keys, Git data or generated VM files.
 SOURCE_FILES = (
     'README.md', 'LICENSE',
-    'build-installer.py', 'build-release.py', '.download-coreos.py', '.env.example',
-    '.esphome-builder.container', '.esphome-tmpfiles.conf', '.motd.txt',
+    'build-installer.py', 'build-release.py', 'download-coreos.py', '.env.example',
+    'esphome-completion.bash', 'esphome-builder.container', 'esphome-tmpfiles.conf', 'motd.txt',
     '.github/workflows/test.yml', '.github/workflows/build-iso.yml',
     '.github/workflows/release.yml',
     'tests/test_builder.py', 'tests/test_download.py',
@@ -27,7 +27,7 @@ def build_release(output, fedora_selection=None):
     metadata = {}
     if fedora_selection is not None:
         selection = json.loads(Path(fedora_selection).read_text(encoding='utf-8'))
-        downloader = runpy.run_path(str(HERE / '.download-coreos.py'))
+        downloader = runpy.run_path(str(HERE / 'download-coreos.py'))
         downloader['validate_selection'](selection)
         metadata['fedora-base.json'] = (json.dumps(selection, indent=2) + '\n').encode()
         names.append('fedora-base.json')

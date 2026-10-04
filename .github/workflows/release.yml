@@ -55,7 +55,7 @@ jobs:
             source="$(git rev-parse "$project_tag^{commit}")"
           fi
           printf 'source=%s\n' "$source" >> "$GITHUB_OUTPUT"
-          python .download-coreos.py prepare .ci
+          python download-coreos.py prepare .ci
           python -c "import json, os; data=json.load(open('.ci/selection.json')); open(os.environ['GITHUB_OUTPUT'], 'a').write('selection='+json.dumps(data)+'\n')"
           if [[ "$EVENT_NAME" == push ]]; then
             if [[ "$REF_TYPE" != tag ]] || ! git merge-base --is-ancestor "$source" refs/remotes/origin/main; then
@@ -112,14 +112,38 @@ jobs:
         env:
           SOURCE_COMMIT: ${{ needs.detect.outputs.source }}
         run: |
-          python -c "import json, os; f=json.load(open('.ci/selection.json')); open(os.environ['GITHUB_OUTPUT'], 'a').write('sha256='+f['sha256']+'\n'); open(os.environ['GITHUB_ENV'], 'a').write('ISO_NAME=esphome-appliance-fcos-'+f['release']+'-'+os.environ['SOURCE_COMMIT'][:12]+'.iso\n')"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          f = json.loads(Path('.ci/selection.json').read_text())
+          prefix = 'esphome-appliance-fcos-' + f['release'] + '-' + os.environ['SOURCE_COMMIT'][:12]
+          names = {
+              'esphome-appliance-setup.zip': prefix + '-setup.zip',
+              'fedora-base.json': prefix + '-fedora-base.json',
+          }
+          directory = Path('build/release')
+          sums = ''.join(line + '\n' for line in (directory / 'SHA256SUMS').read_text().splitlines() if line.split('  ', 1)[1] != 'esphome-appliance.ign')
+          (directory / 'esphome-appliance.ign').unlink()
+          for old, new in names.items():
+              (directory / old).rename(directory / new)
+              sums = sums.replace('  ' + old + '\n', '  ' + new + '\n')
+          (directory / (prefix + '-SHA256SUMS')).write_text(sums)
+          (directory / 'SHA256SUMS').unlink()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as fp:
+              fp.write('sha256=' + f['sha256'] + '\n')
+          with open(os.environ['GITHUB_ENV'], 'a') as fp:
+              fp.write('ASSET_PREFIX=' + prefix + '\nISO_NAME=' + prefix + '.iso\n')
+          PY
       - name: Cache unmodified Fedora ISO
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .ci/base.iso
           key: fedora-coreos-stable-x86_64-iso-${{ steps.fedora.outputs.sha256 }}
       - name: Download or verify pinned Fedora ISO
-        run: python .download-coreos.py fetch .ci
+        run: |
+          downloader=download-coreos.py
+          if [[ ! -f "$downloader" ]]; then downloader=.download-coreos.py; fi
+          python "$downloader" fetch .ci
       - name: Build and verify generic installer ISO
         run: python build-installer.py .ci/base.iso "build/release/$ISO_NAME"
       - name: Verify serial configuration against the original Fedora ISO
@@ -131,11 +155,11 @@ jobs:
       - name: Include ISO checksums
         working-directory: build/release
         run: |
-          cat "$ISO_NAME.sha256" >> SHA256SUMS
-          sha256sum "$ISO_NAME.sha256" >> SHA256SUMS
+          cat "$ISO_NAME.sha256" >> "$ASSET_PREFIX-SHA256SUMS"
+          sha256sum "$ISO_NAME.sha256" >> "$ASSET_PREFIX-SHA256SUMS"
       - name: Verify package checksums
         working-directory: build/release
-        run: sha256sum --check SHA256SUMS
+        run: sha256sum --check "$ASSET_PREFIX-SHA256SUMS"
       - name: Upload build artifacts
         if: needs.detect.outputs.publish != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -155,8 +179,8 @@ jobs:
           FEDORA_SELECTION: ${{ needs.detect.outputs.selection }}
         shell: bash
         run: |
-          assets=(build/release/esphome-appliance.ign build/release/esphome-appliance-setup.zip build/release/SHA256SUMS "build/release/$ISO_NAME" "build/release/$ISO_NAME.sha256")
-          assets+=(build/release/fedora-base.json)
+          assets=("build/release/$ASSET_PREFIX-setup.zip" "build/release/$ASSET_PREFIX-SHA256SUMS" "build/release/$ISO_NAME" "build/release/$ISO_NAME.sha256")
+          assets+=("build/release/$ASSET_PREFIX-fedora-base.json")
           python -c "import json,os; from pathlib import Path; f=json.loads(os.environ['FEDORA_SELECTION']); Path('build/release-notes.md').write_text('ESPHome appliance for Fedora CoreOS stable '+f['release']+'.\n\nOriginal Fedora ISO:\n'+f['location']+'\n\nFedora ISO SHA-256: '+f['sha256']+'\n\nSource commit: '+os.environ['RELEASE_COMMIT']+'\n\nIncludes a bootable generic installer ISO, its checksum, and a small setup package for local builds. Tests and ISO verification passed; publishing does not claim VM runtime validation of this new Fedora release.\n')"
           options=(--target "$RELEASE_COMMIT" --notes-file build/release-notes.md --title "ESPHome appliance ${RELEASE_TAG}")
           if [[ "$RELEASE_TAG" == v* ]]; then
@@ -170,6 +194,12 @@ jobs:
               echo "Release was already published; leaving it unchanged."
               exit 0
             fi
+            python -c "import json; r=json.load(open('build/release-state.json')); legacy={'esphome-appliance-setup.zip','fedora-base.json','SHA256SUMS'}; print('\n'.join(a['name'] for a in r['assets'] if a['name'].endswith('.ign') or a['name'] in legacy))" > build/obsolete-assets.txt
+            while IFS= read -r obsolete; do
+              if [[ -n "$obsolete" ]]; then
+                gh release delete-asset "$RELEASE_TAG" "$obsolete" --yes
+              fi
+            done < build/obsolete-assets.txt
             gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
           else
             gh release create "$RELEASE_TAG" --draft "${assets[@]}" "${options[@]}"

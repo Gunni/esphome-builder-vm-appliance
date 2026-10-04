@@ -18,7 +18,8 @@ workflow = (root / '.github/workflows/release.yml').read_text()
 script = textwrap.dedent(workflow.split('        id: detect\n', 1)[1].split('        run: |\n', 1)[1].split('\n  tests:', 1)[0])
 selection = {'release': '44.20260913.3.2', 'location': 'https://builds.coreos.fedoraproject.org/base.iso', 'sha256': 'a' * 64}
 iso_name = 'esphome-appliance-fcos-44.20260913.3.2-aaaaaaaaaaaa.iso'
-assets = ['esphome-appliance.ign', 'esphome-appliance-setup.zip', 'fedora-base.json', 'SHA256SUMS', iso_name, iso_name + '.sha256']
+asset_prefix = iso_name[:-4]
+assets = [asset_prefix + '-setup.zip', asset_prefix + '-fedora-base.json', asset_prefix + '-SHA256SUMS', iso_name, iso_name + '.sha256']
 complete = {'targetCommitish': 'a' * 40, 'isDraft': False, 'assets': [{'name': name} for name in assets]}
 cases = [
     ('new-fedora', None, 'schedule', 'branch', True, True),
@@ -39,7 +40,7 @@ cases = [
 ]
 with tempfile.TemporaryDirectory(prefix='detect-') as tmp:
     work = Path(tmp)
-    (work / '.download-coreos.py').write_text("import json; from pathlib import Path; Path('.ci').mkdir(exist_ok=True); Path('.ci/selection.json').write_text(json.dumps(" + repr(selection) + "))")
+    (work / 'download-coreos.py').write_text("import json; from pathlib import Path; Path('.ci').mkdir(exist_ok=True); Path('.ci/selection.json').write_text(json.dumps(" + repr(selection) + "))")
     tools = work / 'bin'
     tools.mkdir()
     (tools / 'python').symlink_to(sys.executable)
@@ -121,6 +122,11 @@ elif command in ('create', 'upload'):
     entries = [{'name': p.name, 'size': p.stat().st_size} for p in files]
     if os.environ['CASE'] == 'incomplete-upload': entries.pop()
     state.write_text(json.dumps({'isDraft': True, 'assets': entries}))
+elif command == 'delete-asset':
+    r = json.loads(state.read_text())
+    assert r['isDraft'], 'Cannot delete assets from an immutable release'
+    r['assets'] = [a for a in r['assets'] if a['name'] != sys.argv[4]]
+    state.write_text(json.dumps(r))
 elif command == 'edit':
     r = json.loads(state.read_text())
     assert r['isDraft'], 'Cannot edit an immutable release'
@@ -131,14 +137,14 @@ else:
     raise AssertionError(sys.argv)
 ''')
     gh.chmod(0o755)
-    for case in ['new-release', 'retry-draft', 'already-published', 'incomplete-upload']:
+    for case in ['new-release', 'retry-draft', 'legacy-draft', 'already-published', 'incomplete-upload']:
         state = work / 'state.json'
         calls = work / 'calls.log'
         state.unlink(missing_ok=True)
         calls.unlink(missing_ok=True)
-        if case in ['retry-draft', 'already-published']:
-            state.write_text(json.dumps({'isDraft': case == 'retry-draft', 'assets': []}))
-        env = {**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'CASE': case, 'RELEASE_STATE': str(state), 'RELEASE_CALLS': str(calls), 'ISO_NAME': iso_name, 'RELEASE_TAG': 'v1.0.0', 'RELEASE_COMMIT': 'a' * 40, 'FEDORA_SELECTION': json.dumps(selection)}
+        if case in ['retry-draft', 'legacy-draft', 'already-published']:
+            state.write_text(json.dumps({'isDraft': case != 'already-published', 'assets': [{'name': 'esphome-appliance.ign', 'size': 12}, {'name': 'SHA256SUMS', 'size': 12}] if case == 'legacy-draft' else []}))
+        env = {**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'CASE': case, 'RELEASE_STATE': str(state), 'RELEASE_CALLS': str(calls), 'ISO_NAME': iso_name, 'ASSET_PREFIX': asset_prefix, 'RELEASE_TAG': 'v1.0.0', 'RELEASE_COMMIT': 'a' * 40, 'FEDORA_SELECTION': json.dumps(selection)}
         result = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', publication], cwd=work, env=env, capture_output=True, text=True)
         operations = calls.read_text().splitlines()
         if case == 'incomplete-upload':
@@ -149,7 +155,8 @@ else:
             if case == 'already-published':
                 assert operations == ['view'], operations
             else:
-                assert operations == ['view', 'create' if case == 'new-release' else 'upload', 'view', 'edit'], operations
+                expected_ops = ['view'] + (['delete-asset', 'delete-asset'] if case == 'legacy-draft' else []) + ['create' if case == 'new-release' else 'upload', 'view', 'edit']
+                assert operations == expected_ops, operations
                 assert not json.loads(state.read_text())['isDraft']
         print('PASS:', case, 'published assets remain immutable')
 
@@ -159,11 +166,39 @@ with tempfile.TemporaryDirectory(prefix='iso-name-') as tmp:
     work = Path(tmp)
     (work / '.ci').mkdir()
     (work / '.ci/selection.json').write_text(json.dumps(selection))
+    output = work / 'build/release'
+    output.mkdir(parents=True)
+    subprocess.run([sys.executable, str(root / 'build-release.py'), str(output), '--fedora-selection', str(work / '.ci/selection.json')], check=True, capture_output=True)
+    import hashlib
+    import zipfile
     tools = work / 'bin'
     tools.mkdir()
     (tools / 'python').symlink_to(sys.executable)
     env = {**os.environ, 'PATH': str(tools) + ':' + os.environ['PATH'], 'SOURCE_COMMIT': '9701a46d0556f44996ae22a0a45fc2dc6a0bf48b', 'GITHUB_SHA': 'b' * 40, 'GITHUB_ENV': str(work / 'env'), 'GITHUB_OUTPUT': str(work / 'output')}
     subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', naming], cwd=work, env=env, check=True)
-    assert (work / 'env').read_text() == 'ISO_NAME=esphome-appliance-fcos-44.20260913.3.2-9701a46d0556.iso\n'
+    assert (work / 'env').read_text() == 'ASSET_PREFIX=esphome-appliance-fcos-44.20260913.3.2-9701a46d0556\nISO_NAME=esphome-appliance-fcos-44.20260913.3.2-9701a46d0556.iso\n'
     assert (work / 'output').read_text() == 'sha256=' + selection['sha256'] + '\n'
     print('PASS: ISO filename uses selected Fedora version and actual source revision')
+    prefix = 'esphome-appliance-fcos-44.20260913.3.2-9701a46d0556'
+    assert {p.name for p in output.iterdir()} == {prefix + '-setup.zip', prefix + '-fedora-base.json', prefix + '-SHA256SUMS'}
+    for line in (output / (prefix + '-SHA256SUMS')).read_text().splitlines():
+        digest, name = line.split('  ', 1)
+        assert digest == hashlib.sha256((output / name).read_bytes()).hexdigest()
+    print('PASS: all package filenames and checksum entries identify Fedora/source')
+    with zipfile.ZipFile(output / (prefix + '-setup.zip')) as archive:
+        ignition = json.loads(archive.read('esphome-appliance/esphome-appliance.ign'))
+        assert ignition['ignition']['version']
+        assert json.loads(archive.read('esphome-appliance/fedora-base.json')) == selection
+    assert not list(output.glob('*.ign'))
+    print('PASS: Ignition stays in the ZIP only; manifest covers every external package asset')
+
+# Scheduled builds use the latest project tag, which may predate visible filenames.
+fetch_script = textwrap.dedent(workflow.split('      - name: Download or verify pinned Fedora ISO\n        run: |\n', 1)[1].split('      - name:', 1)[0])
+with tempfile.TemporaryDirectory() as tmp:
+    for downloader in ('download-coreos.py', '.download-coreos.py'):
+        work = Path(tmp) / downloader.replace('.', '_')
+        work.mkdir()
+        (work / downloader).write_text('import sys\nassert sys.argv[1:] == ["fetch", ".ci"]\nprint("downloaded")\n')
+        result = subprocess.run(['bash', '-e', '-c', fetch_script], cwd=work, capture_output=True, text=True, check=True)
+        assert result.stdout.strip() == 'downloaded'
+print('PASS: Fedora fetch supports current filenames and historical project tags')
