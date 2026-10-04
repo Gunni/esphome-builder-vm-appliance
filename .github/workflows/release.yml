@@ -21,6 +21,7 @@ jobs:
       tag: ${{ steps.detect.outputs.tag }}
       selection: ${{ steps.detect.outputs.selection }}
       source: ${{ steps.detect.outputs.source }}
+      source_tag: ${{ steps.detect.outputs.source_tag }}
     steps:
       - name: Configure Git advice
         run: |
@@ -63,16 +64,24 @@ jobs:
               exit 0
             fi
             tag="$REF_NAME"
+            source_tag="$REF_NAME"
           else
+            source_tag="$project_tag"
             tag="fcos-$(python -c "import json; print(json.load(open('.ci/selection.json'))['release'])")"
           fi
-          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+          # Trust comes from main, never from the candidate tag's own key list.
+          git show refs/remotes/origin/main:.github/allowed_signers > .ci/trusted-signers
+          git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=.ci/trusted-signers verify-tag "$source_tag"
+          [[ "$(git rev-parse "$source_tag^{commit}")" == "$source" ]] || { echo 'Signed tag/source mismatch' >&2; exit 1; }
+          printf 'source_tag=%s\n' "$source_tag" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n'  "$tag" >> "$GITHUB_OUTPUT"
           if gh release view "$tag" --json isDraft,assets,targetCommitish > .ci/existing-release.json 2>/dev/null; then
             if python -c "import json,sys; r=json.load(open('.ci/existing-release.json')); sys.exit(0 if not r['isDraft'] else 1)"; then
               echo "Published release $tag is immutable; leaving it unchanged."
               exit 0
             fi
-            python -c "import json,os; r=json.load(open('.ci/existing-release.json')); open(os.environ['GITHUB_OUTPUT'], 'a').write('source='+r['targetCommitish']+'\n')"
+            draft_source="$(python -c "import json; print(json.load(open('.ci/existing-release.json'))['targetCommitish'])")"
+            [[ "$(git rev-parse "$draft_source^{commit}")" == "$source" ]] || { echo 'Draft source differs from the verified signed tag; refusing publication' >&2; exit 1; }
           fi
           printf 'build=true\npublish=true\n' >> "$GITHUB_OUTPUT"
 
@@ -88,6 +97,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Configure Git advice
         run: |
@@ -160,6 +171,26 @@ jobs:
       - name: Verify package checksums
         working-directory: build/release
         run: sha256sum --check "$ASSET_PREFIX-SHA256SUMS"
+      - name: Record the verified release inputs
+        if: needs.detect.outputs.publish == 'true'
+        env:
+          SOURCE_COMMIT: ${{ needs.detect.outputs.source }}
+          SOURCE_TAG: ${{ needs.detect.outputs.source_tag }}
+        run: |
+          python - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          # Scheduled runs execute main's workflow but build the signed project tag.
+          data = {'source_commit': os.environ['SOURCE_COMMIT'], 'source_tag': os.environ['SOURCE_TAG'], 'fedora': json.loads(Path('.ci/selection.json').read_text())}
+          Path('.ci/release-inputs.json').write_text(json.dumps(data))
+          PYTHON
+      - name: Attest release assets and their selected source
+        if: needs.detect.outputs.publish == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: build/release/*
+          predicate-type: https://github.com/Gunni/esphome-builder-vm-appliance/attestations/release-inputs/v1
+          predicate-path: .ci/release-inputs.json
       - name: Upload build artifacts
         if: needs.detect.outputs.publish != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -181,7 +212,7 @@ jobs:
         run: |
           assets=("build/release/$ASSET_PREFIX-setup.zip" "build/release/$ASSET_PREFIX-SHA256SUMS" "build/release/$ISO_NAME" "build/release/$ISO_NAME.sha256")
           assets+=("build/release/$ASSET_PREFIX-fedora-base.json")
-          python -c "import json,os; from pathlib import Path; f=json.loads(os.environ['FEDORA_SELECTION']); Path('build/release-notes.md').write_text('ESPHome appliance for Fedora CoreOS stable '+f['release']+'.\n\nOriginal Fedora ISO:\n'+f['location']+'\n\nFedora ISO SHA-256: '+f['sha256']+'\n\nSource commit: '+os.environ['RELEASE_COMMIT']+'\n\nIncludes a bootable generic installer ISO, its checksum, and a small setup package for local builds. Tests and ISO verification passed; publishing does not claim VM runtime validation of this new Fedora release.\n')"
+          python -c "import json,os; from pathlib import Path; f=json.loads(os.environ['FEDORA_SELECTION']); Path('build/release-notes.md').write_text('ESPHome appliance based on Fedora CoreOS stable '+f['release']+'.\n\nOriginal Fedora ISO:\n'+f['location']+'\n\nFedora ISO SHA-256: '+f['sha256']+'\n\nSource commit: '+os.environ['RELEASE_COMMIT']+'\n\nIncludes a bootable generic installer ISO, its checksum, and a small setup package for local builds. Tests and ISO verification passed; publishing does not claim VM runtime validation of this new Fedora release.\n')"
           options=(--target "$RELEASE_COMMIT" --notes-file build/release-notes.md --title "ESPHome appliance ${RELEASE_TAG}")
           if [[ "$RELEASE_TAG" == v* ]]; then
             options+=(--verify-tag)

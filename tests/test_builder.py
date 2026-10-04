@@ -207,7 +207,7 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(user['sshAuthorizedKeys'], ['@SSH_KEY@'])
         provision = files['/usr/local/bin/provision-esphome-appliance']
         self.assertIn('https://github.com/$github_username.keys', provision)
-        self.assertNotIn('ssh-keygen', provision)
+        self.assertIn('ssh-keygen -lf /run/esphome/github.keys ||', provision)
         units = {u['name']: u['contents'] for u in live['systemd']['units']}
         self.assertIn('Requires=esphome-provision.service', units['install-esphome-appliance.service'])
         self.assertIn('After=esphome-provision.service', units['install-esphome-appliance.service'])
@@ -257,9 +257,7 @@ class BuilderTests(unittest.TestCase):
         dropins = {u["name"]: u.get("dropins", []) for u in dest["systemd"]["units"]}
         self.assertNotIn("hypervkvpd", json.dumps(dest))
         self.assertNotIn("qemu-guest-agent", json.dumps(dest))
-        for item in B["generic_config"]()["systemd"]["units"]:
-            for virt in ["microsoft", "kvm", "qemu"]:
-                self.assertIn("ConditionVirtualization=|" + virt, item["contents"])
+        self.assertNotIn("ConditionVirtualization=", json.dumps(B["generic_config"]()["systemd"]))
 
     @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'Needs POSIX bash')
     def test_builder_shell_reuses_process_environment(self):
@@ -306,6 +304,9 @@ class BuilderTests(unittest.TestCase):
         tmpfiles = files['/etc/tmpfiles.d/esphome-appliance.conf']
         directories = {fields[1]: fields for line in tmpfiles.splitlines()
                        if line.startswith('d ') for fields in [line.split()]}
+        for name in ('config', 'cache', 'build', 'ccache'):
+            self.assertEqual(directories['/var/lib/esphome/' + name][2:5],
+                             ['0700', 'esphome', 'esphome'])
         for item in dest['storage']['files'] + dest['storage']['links']:
             parent = PurePosixPath(item['path']).parent
             while parent.is_relative_to('/var/home/esphome'):
@@ -318,7 +319,9 @@ class BuilderTests(unittest.TestCase):
         manager = next(u for u in dest['systemd']['units'] if u['name'] == 'user@2000.service')
         self.assertEqual(manager['dropins'][0]['contents'],
                          '[Unit]\nRequires=esphome-tools.service\nAfter=esphome-tools.service\n')
-        self.assertIn('WantedBy=default.target', quadlet)
+        self.assertNotIn('WantedBy=', quadlet)
+        self.assertNotIn('Restart=', quadlet)
+        self.assertNotIn('Wants=esphome-builder.service', files['/var/home/esphome/.config/systemd/user/podman-auto-update.timer.d/10-appliance-schedule.conf'])
         self.assertNotIn('esphome-tools.service', quadlet)
         self.assertNotIn('/etc/containers/systemd/esphome-builder.container', files)
         system_names = {u['name'] for u in dest['systemd']['units']}
@@ -371,6 +374,36 @@ class BuilderTests(unittest.TestCase):
                     args = args[3:]
                 self.assertEqual(args, expected + forwarded)
 
+    @unittest.skipUnless(os.name == 'posix' and shutil.which('bash') and shutil.which('jq'), 'Needs Bash and jq')
+    def test_pairing_boot_gate_and_explicit_helper(self):
+        import shlex
+        files = decode_files(B['configs'](KEY, 'operator'))
+        unit = files['/etc/systemd/user/esphome-start-paired.service']
+        self.assertIn('ConditionUser=esphome', unit)
+        self.assertIn('ConditionPathExists=/var/lib/esphome/config/.receiver_peers.json', unit)
+        command = shlex.split(next(line.split('=', 1)[1] for line in unit.splitlines() if line.startswith('ExecCondition=')))
+        state = self.root / 'peers.json'
+        command[-1] = str(state)
+        peer = dict(dashboard_id='dashboard', static_x25519_pub=base64.b64encode(bytes(32)).decode(), label='test', pin_sha256='a'*64, paired_at=1.0)
+        for data, expected in [(None, False), ({'peers': []}, False), ({'peers': [peer]}, True), ({'peers': [peer, {}]}, False), ({'peers': [{**peer, 'static_x25519_pub': 'invalid'}]}, False), ('broken', False)]:
+            if data is None:
+                state.unlink(missing_ok=True)
+            else:
+                state.write_text(data if isinstance(data, str) else json.dumps(data))
+            result = subprocess.run(command, capture_output=True)
+            self.assertEqual(result.returncode == 0, expected, data)
+        start, logs = self.root / 'start', self.root / 'logs'
+        start.write_text('#!/bin/bash\nexit "${START_EXIT:-0}"\n'); start.chmod(0o755)
+        logs.write_text('#!/bin/bash\nprintf "%s\\0" "$@"\n'); logs.chmod(0o755)
+        helper = self.root / 'pairing'
+        helper.write_text(files['/usr/local/bin/esphome-pairing'].replace('/usr/local/bin/esphome-start', str(start)).replace('/usr/local/bin/esphome-logs', str(logs)))
+        result = subprocess.run(['bash', str(helper), '--no-pager'], capture_output=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.split(b'\0')[:-1], [b'--follow', b'--lines=30', b'--no-pager'])
+        result = subprocess.run(['bash', str(helper)], env={**os.environ, 'START_EXIT':'23'}, capture_output=True)
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(result.stdout, b'')
+
     @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'Needs POSIX bash')
     def test_completion_context_and_no_privileged_queries(self):
         dest = B['configs'](KEY, 'operator')
@@ -390,10 +423,10 @@ class BuilderTests(unittest.TestCase):
             _esphome_complete
             [[ $COMP_CWORD == 2 && ${COMP_WORDS[0]} == "$2" ]] || exit 98
         """
-        for verb in ('logs', 'start', 'stop', 'restart', 'status', 'update', 'timers'):
+        for verb in ('logs', 'pairing', 'start', 'stop', 'restart', 'status', 'update', 'timers'):
             result = subprocess.run(['bash', '-c', harness, 'completion-test', str(script), 'esphome-' + verb], capture_output=True, check=True)
             args = result.stdout.decode().split('\0')[:-1]
-            if verb == 'logs':
+            if verb in ('logs', 'pairing'):
                 self.assertEqual(args, ['2', 'journalctl', '--output', 'json'])
             else:
                 command = 'start' if verb == 'update' else 'list-timers' if verb == 'timers' else verb
@@ -504,7 +537,7 @@ class BuilderTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "Needs Linux/POSIX bash")
     def test_guest_script_syntax(self):
-        for name in ["INSTALL", "PROVISION", "ESPHOME_SHELL", "DISABLE_AUTOLOGIN"]:
+        for name in ["INSTALL", "PROVISION", "ESPHOME_SHELL", "ESPHOME_PAIRING", "DISABLE_AUTOLOGIN"]:
             script = self.root / (name + ".sh")
             script.write_text(B[name])
             result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)

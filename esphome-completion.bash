@@ -5,7 +5,7 @@ _esphome_complete() {
     local COMP_CWORD=$COMP_CWORD
     local COMP_LINE=${COMP_LINE-} COMP_POINT=${COMP_POINT:-0}
     case $helper in
-        esphome-logs)
+        esphome-logs|esphome-pairing)
             command=journalctl
             COMP_WORDS[0]=$command
             prefix=$command
@@ -34,4 +34,4 @@ _esphome_complete() {
     declare -F "_$command" >/dev/null || return 0
     "_$command"
 }
-complete -F _esphome_complete esphome-logs esphome-start esphome-stop esphome-restart esphome-status esphome-update esphome-timers
+complete -F _esphome_complete esphome-pairing esphome-logs esphome-start esphome-stop esphome-restart esphome-status esphome-update esphome-timers

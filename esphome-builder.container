@@ -1,6 +1,5 @@
 [Unit]
 Description=ESPHome dedicated remote builder
-StartLimitIntervalSec=0
 
 [Container]
 Image=ghcr.io/esphome/esphome:stable
@@ -19,10 +18,6 @@ Volume=/var/tmp/esphome:/tmp:Z
 StopTimeout=60
 
 [Service]
-Restart=always
-RestartSec=30
 TimeoutStartSec=0
 TimeoutStopSec=90
 
-[Install]
-WantedBy=default.target

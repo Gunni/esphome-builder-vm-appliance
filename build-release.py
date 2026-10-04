@@ -13,7 +13,7 @@ SOURCE_FILES = (
     'build-installer.py', 'build-release.py', 'download-coreos.py', '.env.example',
     'esphome-completion.bash', 'esphome-builder.container', 'esphome-tmpfiles.conf', 'motd.txt',
     '.github/workflows/test.yml', '.github/workflows/build-iso.yml',
-    '.github/workflows/release.yml',
+    '.github/workflows/release.yml', '.github/allowed_signers', '.github/dependabot.yml',
     'tests/test_builder.py', 'tests/test_download.py',
     'tests/test_disk_selection.py', 'tests/test_provision.py', 'tests/test_release.py',
     'tests/check_workflow.py',

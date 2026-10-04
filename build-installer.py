@@ -53,6 +53,13 @@ ESPHOME_SHELL = dedent(r"""
     '
 """).lstrip("\n")
 
+ESPHOME_PAIRING = dedent(r"""
+    #!/usr/bin/bash
+    set -euo pipefail
+    /usr/local/bin/esphome-start
+    exec /usr/local/bin/esphome-logs --follow --lines=30 "$@"
+""").lstrip("\n")
+
 DISABLE_AUTOLOGIN = dedent(r"""
     #!/usr/bin/bash
     set -euo pipefail
@@ -91,21 +98,29 @@ INSTALL = dedent(r"""
     (( ties == 1 )) || refuse 'multiple disks share the largest size'
     test -b "$disk" || refuse 'selected device is not a block device'
     if (( bytes < 50 * 1024 * 1024 * 1024 || bytes > 80 * 1024 * 1024 * 1024 )); then
-        refuse "$disk is outside expected 50-80 GiB range"
+        refuse "$disk is outside expected 50-80 GiB range; use a disk within those bounds or rebuild the ISO with MIN_DISK_GIB/MAX_DISK_GIB in .env"
     fi
-    nodes=$(lsblk --noheadings --raw --paths --output NAME "$disk")
-    [ "$nodes" = "$disk" ] || refuse "$disk has partitions or mapped child devices"
+    nodes=$(lsblk --noheadings --raw --paths --output NAME,TYPE "$disk")
+    while read -r node type; do
+        [[ "$type" == disk || "$type" == part ]] || refuse "$disk has active mapped child devices"
+    done <<< "$nodes"
     mounts=$(lsblk --noheadings --raw --output MOUNTPOINTS "$disk")
     [[ "$mounts" =~ ^[[:space:]]*$ ]] || refuse "$disk is mounted or used as swap"
     signatures=$(wipefs --no-act --noheadings --output TYPE "$disk")
-    [ -z "$signatures" ] || refuse "$disk has a filesystem, partition-table or RAID signature"
-    # Recheck topology/signatures immediately before the destructive operation.
-    nodes=$(lsblk --noheadings --raw --paths --output NAME "$disk")
-    signatures=$(wipefs --no-act --noheadings --output TYPE "$disk")
+    if [[ "$nodes" != "$disk disk" || -n "$signatures" ]]; then
+        echo "Selected non-empty disk: $disk ($bytes bytes). Existing contents will be overwritten."
+        printf '%s\n' "$nodes" "$signatures"
+        printf 'To erase and reinstall, type ERASE %s (anything else cancels): ' "$disk"
+        read -r confirmation || refuse 'disk erase was not confirmed'
+        [ "$confirmation" = "ERASE $disk" ] || refuse 'disk erase was not confirmed'
+    fi
+    # Recheck the exact confirmed state immediately before the destructive operation.
+    current_nodes=$(lsblk --noheadings --raw --paths --output NAME,TYPE "$disk")
+    current_signatures=$(wipefs --no-act --noheadings --output TYPE "$disk")
     mounts=$(lsblk --noheadings --raw --output MOUNTPOINTS "$disk")
     current_bytes=$(blockdev --getsize64 "$disk")
-    [ "$nodes" = "$disk" ] || refuse 'disk topology changed'
-    [ -z "$signatures" ] || refuse 'disk signatures changed'
+    [ "$current_nodes" = "$nodes" ] || refuse 'disk topology changed'
+    [ "$current_signatures" = "$signatures" ] || refuse 'disk signatures changed'
     [[ "$mounts" =~ ^[[:space:]]*$ ]] || refuse 'disk became mounted'
     [ "$current_bytes" = "$bytes" ] || refuse 'disk size changed'
     echo "Disk checks passed: $disk ($bytes bytes). Installing Fedora CoreOS."
@@ -128,6 +143,8 @@ def configs(ssh_key, username, ntp_pools=None):
         ]},
         'storage': {'links': [
             {'path': '/etc/localtime', 'target': '/usr/share/zoneinfo/UTC', 'overwrite': True},
+            {'path': '/var/home/esphome/.config/systemd/user/default.target.wants/esphome-start-paired.service',
+             'target': '/etc/systemd/user/esphome-start-paired.service'},
         ] + [
             {'path': '/var/home/esphome/.config/systemd/user/timers.target.wants/' + name,
              'target': target}
@@ -144,6 +161,17 @@ def configs(ssh_key, username, ntp_pools=None):
             file('/etc/motd.d/20-esphome-appliance', (HERE / 'motd.txt').read_text(encoding='utf-8').replace('@USERNAME@', username).replace('@NTP_POOLS@', ' '.join(ntp_pools or DEFAULT_NTP_POOLS))),
             file('/etc/bash_completion.d/esphome-appliance', (HERE / 'esphome-completion.bash').read_text(encoding='utf-8')),
             file('/usr/local/bin/esphome-shell', ESPHOME_SHELL, mode=0o755),
+            file('/usr/local/bin/esphome-pairing', ESPHOME_PAIRING, mode=0o755),
+            file('/etc/systemd/user/esphome-start-paired.service', dedent(r"""
+                [Unit]
+                Description=Start ESPHome only with an existing approved pairing
+                ConditionUser=esphome
+                ConditionPathExists=/var/lib/esphome/config/.receiver_peers.json
+                [Service]
+                Type=oneshot
+                ExecCondition=/usr/bin/jq --exit-status '(.peers | type == "array" and length > 0) and all(.peers[]; (.dashboard_id | type == "string" and length > 0) and (.static_x25519_pub | type == "string" and (gsub("[[:space:]]"; "") | test("^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"))) and (.label | type == "string") and (.pin_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and (.paired_at | type == "number"))' /var/lib/esphome/config/.receiver_peers.json
+                ExecStart=/usr/bin/systemctl --user start esphome-builder.service
+            """).lstrip("\n")),
             file('/usr/local/bin/esphome-disable-autologin', DISABLE_AUTOLOGIN, mode=0o755),
             *[file('/usr/local/bin/' + name, '#!/usr/bin/bash\nexec ' + command + ' "$@"\n', mode=0o755)
               for name, command in ESPHOME_COMMANDS.items()],
@@ -167,7 +195,6 @@ def configs(ssh_key, username, ntp_pools=None):
             """).lstrip("\n")),
             file('/var/home/esphome/.config/systemd/user/podman-auto-update.timer.d/10-appliance-schedule.conf', dedent(r"""
                 [Unit]
-                Wants=esphome-builder.service
                 After=esphome-builder.service
                 [Timer]
                 OnCalendar=
@@ -261,27 +288,52 @@ PROVISION = dedent(r"""
     defaults=/etc/esphome-appliance/account-defaults.json
     username=$(jq -r '.username' "$defaults")
     umask 077
-    if [ -z "$username" ]; then
-        printf 'Linux system username: '
-        read -r username
-    fi
-    [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || refuse 'invalid Linux username'
-    [[ "$username" != root && "$username" != core && "$username" != esphome ]] || refuse 'choose a username other than root, core or esphome'
+    while :; do
+        if [ -z "$username" ]; then
+            printf 'Linux system username: '
+            read -r username || refuse 'input ended before username was supplied'
+        fi
+        if [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] &&
+           [[ "$username" != root && "$username" != core && "$username" != esphome ]]; then
+            break
+        fi
+        echo 'Use a lowercase Linux account name other than root, core or esphome.'
+        username=
+    done
     jq -j '.ssh_key' "$defaults" > /run/esphome/github.keys
     if [ ! -s /run/esphome/github.keys ]; then
-        printf 'GitHub username (all SSH public keys; Enter to skip SSH setup): '
-        read -r github_username
-        if [ -n "$github_username" ]; then
-            [[ "$github_username" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$ ]] || refuse 'invalid GitHub username'
-            [[ "$github_username" != *--* ]] || refuse 'invalid GitHub username'
+        while :; do
+            printf 'GitHub username (all SSH public keys; Enter to skip SSH setup): '
+            read -r github_username || refuse 'input ended before SSH setup was chosen'
+            : > /run/esphome/github.keys
+            if [ -z "$github_username" ]; then
+                echo 'Skipping SSH keys. Use console autologin to access the appliance.'
+                break
+            fi
+            if [[ ! "$github_username" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$ ]] ||
+               [[ "$github_username" == *--* ]]; then
+                echo 'Invalid GitHub username; try again.'
+                continue
+            fi
             echo "Downloading SSH public keys for $github_username..."
-            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            if ! curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
                 --connect-timeout 15 --max-time 60 --retry 3 \
-                "https://github.com/$github_username.keys" --output /run/esphome/github.keys
-            [ -s /run/esphome/github.keys ] || refuse 'this GitHub account has no SSH public keys'
-        else
-            echo 'Skipping SSH keys. Use console autologin to access the appliance.'
-        fi
+                "https://github.com/$github_username.keys" --output /run/esphome/github.keys; then
+                echo 'Download failed; retry or press Enter to skip SSH.'
+                continue
+            fi
+            if [ ! -s /run/esphome/github.keys ]; then
+                echo 'This GitHub account has no public keys; try again or skip SSH.'
+                continue
+            fi
+            printf 'GitHub account %s: %s public key entries.\n' "$github_username" "$(awk 'NF {n++} END {print n+0}' /run/esphome/github.keys)"
+            # Fingerprints inform confirmation; they do not reject downloaded keys.
+            ssh-keygen -lf /run/esphome/github.keys || echo 'Some entries could not be fingerprinted; keys will be used as downloaded.'
+            printf 'Authorize these keys for this GitHub account? [y/N]: '
+            read -r answer || refuse 'input ended before key confirmation'
+            case "$answer" in y|Y|yes|YES) break ;; esac
+            echo 'Keys discarded; choose the account again or skip SSH.'
+        done
     else
         echo 'Using public SSH key supplied at build time.'
     fi
@@ -325,9 +377,6 @@ def generic_config(username="", ssh_key="", serial_console=False, **settings):
             unit('esphome-provision.service', dedent(r"""
                 [Unit]
                 Description=Configure ESPHome account defaults or GitHub SSH keys
-                ConditionVirtualization=|microsoft
-                ConditionVirtualization=|kvm
-                ConditionVirtualization=|qemu
                 Wants=network-online.target getty-pre.target
                 After=network-online.target systemd-tmpfiles-setup.service
                 Before=getty-pre.target install-esphome-appliance.service
@@ -348,10 +397,7 @@ def generic_config(username="", ssh_key="", serial_console=False, **settings):
             """).lstrip("\n")),
             unit('install-esphome-appliance.service', dedent(r"""
                 [Unit]
-                Description=Install ESPHome appliance to the largest empty disk
-                ConditionVirtualization=|microsoft
-                ConditionVirtualization=|kvm
-                ConditionVirtualization=|qemu
+                Description=Install ESPHome appliance to the largest disk
                 Requires=esphome-provision.service
                 Wants=getty-pre.target
                 After=esphome-provision.service
@@ -361,6 +407,9 @@ def generic_config(username="", ssh_key="", serial_console=False, **settings):
                 Type=oneshot
                 ExecStartPre=/usr/bin/busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager SetShowStatus s no
                 ExecStart=/usr/local/bin/install-esphome-appliance
+                StandardInput=tty
+                TTYPath=/dev/console
+                TTYReset=yes
                 ExecStopPost=/usr/bin/busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager SetShowStatus s ""
                 StandardOutput=journal+console
                 StandardError=journal+console

@@ -14,6 +14,10 @@ for path in (root / '.github/workflows').glob('*.yml'):
     for reference in re.findall(r'^\s*(?:-\s*)?uses:\s*(\S+)', path.read_text(), re.MULTILINE):
         assert reference.startswith('./') or re.fullmatch(r'actions/[a-z-]+@[0-9a-f]{40}', reference), (path, reference)
 print('PASS: external actions are pinned to full commit SHAs')
+for path in (root / '.github/workflows').glob('*.yml'):
+    for reference in re.findall(r'go run\s+(\S+)', path.read_text()):
+        assert re.fullmatch(r'github\.com/[\w./-]+@[0-9a-f]{40}', reference), (path, reference)
+print('PASS: Go build tools are pinned to full commit SHAs')
 workflow = (root / '.github/workflows/release.yml').read_text()
 script = textwrap.dedent(workflow.split('        id: detect\n', 1)[1].split('        run: |\n', 1)[1].split('\n  tests:', 1)[0])
 selection = {'release': '44.20260913.3.2', 'location': 'https://builds.coreos.fedoraproject.org/base.iso', 'sha256': 'a' * 64}
@@ -49,18 +53,28 @@ with tempfile.TemporaryDirectory(prefix='detect-') as tmp:
     gh.chmod(0o755)
     # Real Git objects/ancestry: the highest overall tag is on an unmerged branch.
     repo = work / 'git-fixture'
-    git_env = {**os.environ, 'GIT_DIR': str(repo), 'GIT_AUTHOR_NAME': 'Fixture', 'GIT_AUTHOR_EMAIL': 'fixture@example.invalid', 'GIT_COMMITTER_NAME': 'Fixture', 'GIT_COMMITTER_EMAIL': 'fixture@example.invalid'}
+    git_env = {**os.environ, 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_DIR': str(repo), 'GIT_AUTHOR_NAME': 'Fixture', 'GIT_AUTHOR_EMAIL': 'fixture@example.invalid', 'GIT_COMMITTER_NAME': 'Fixture', 'GIT_COMMITTER_EMAIL': 'fixture@example.invalid'}
     def git(*args, input=''):
         return subprocess.check_output(['git', *args], env=git_env, input=input, text=True).strip()
     git('init', '--bare', '--quiet', str(repo))
-    tree = git('mktree')
+    signing_key = work / 'signing-key'
+    subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(signing_key)], check=True)
+    trusted_signers = 'fixture@example.invalid namespaces="git" ' + signing_key.with_suffix('.pub').read_text()
+    blob = git('hash-object', '-w', '--stdin', input=trusted_signers)
+    github_tree = git('mktree', input='100644 blob ' + blob + '\tallowed_signers\n')
+    tree = git('mktree', input='040000 tree ' + github_tree + '\t.github\n')
+    git('config', 'gpg.format', 'ssh')
+    git('config', 'user.signingkey', str(signing_key))
+    git('config', 'user.name', 'Fixture')
+    git('config', 'user.email', 'fixture@example.invalid')
     old_source = git('commit-tree', tree, input='old main')
     tagged_source = git('commit-tree', tree, '-p', old_source, input='tagged main')
     main_source = git('commit-tree', tree, '-p', tagged_source, input='current main')
     feature_source = git('commit-tree', tree, '-p', old_source, input='unmerged feature')
     git('update-ref', 'refs/remotes/origin/main', main_source)
-    git('update-ref', 'refs/tags/v1.9.0', old_source)
-    git('update-ref', 'refs/tags/v1.10.0', tagged_source)
+    git('tag', '-s', '-m', 'fixture', 'v1.9.0', old_source)
+    git('tag', '-s', '-m', 'fixture', 'v1.10.0', tagged_source)
+    git('tag', '-s', '-m', 'fixture', 'v1.0.0', tagged_source)
     git('update-ref', 'refs/tags/v9.0.0', feature_source)
     for name, existing, event, ref_type, build, publish in cases:
         fixture = work / 'release.json'
@@ -73,6 +87,7 @@ with tempfile.TemporaryDirectory(prefix='detect-') as tmp:
         if name == 'no-project-tags':
             git('update-ref', '-d', 'refs/tags/v1.9.0')
             git('update-ref', '-d', 'refs/tags/v1.10.0')
+            git('update-ref', '-d', 'refs/tags/v1.0.0')
         env = {**git_env, 'PATH': str(tools) + ':' + os.environ['PATH'], 'GH_REPO': 'test/repo', 'SOURCE_COMMIT': source_commit, 'EVENT_NAME': event, 'REF_TYPE': ref_type, 'REF_NAME': 'v1.0.0' if ref_type == 'tag' else 'feature/test' if name == 'feature-push' else 'main', 'GITHUB_OUTPUT': str(output), 'RELEASE_FIXTURE': str(fixture)}
         result = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', script], cwd=work, env=env, capture_output=True, text=True)
         assert result.returncode == 0, (name, result.stderr)
@@ -90,6 +105,35 @@ with tempfile.TemporaryDirectory(prefix='detect-') as tmp:
             else:
                 assert 'tag' not in values
         print('PASS:', name, 'build=' + values['build'], 'publish=' + values['publish'])
+
+
+    # Actual cryptographic failures: neither tag presence nor arbitrary signatures establish trust.
+    git('update-ref', 'refs/tags/v2.0.0', tagged_source)
+    other_key = work / 'untrusted-key'
+    subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(other_key)], check=True)
+    git('-c', 'user.signingkey=' + str(other_key), 'tag', '-s', '-m', 'untrusted', 'v3.0.0', tagged_source)
+    git('tag', '-s', '-m', 'trusted', 'v4.0.0', tagged_source)
+    for name, ref, event, commit, draft in [
+        ('unsigned-tag', 'v2.0.0', 'push', tagged_source, None),
+        ('untrusted-signer', 'v3.0.0', 'push', tagged_source, None),
+        ('tag-source-mismatch', 'v4.0.0', 'push', main_source, None),
+        ('draft-source-mismatch', 'v4.0.0', 'push', tagged_source, main_source),
+    ]:
+        fixture.unlink(missing_ok=True)
+        if draft:
+            fixture.write_text(json.dumps({'isDraft': True, 'assets': [], 'targetCommitish': draft}))
+        output.unlink(missing_ok=True)
+        env.update(EVENT_NAME=event, REF_TYPE='tag', REF_NAME=ref, SOURCE_COMMIT=commit)
+        result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', script], cwd=work, env=env, capture_output=True, text=True)
+        assert result.returncode != 0, (name, result.stdout, result.stderr)
+        assert 'publish=true' not in output.read_text(), name
+        print('PASS:', name, 'refused')
+    git('update-ref', '-d', 'refs/tags/v4.0.0')
+    env.update(EVENT_NAME='schedule', REF_TYPE='branch', REF_NAME='main', SOURCE_COMMIT=main_source)
+    output.unlink(missing_ok=True)
+    result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', script], cwd=work, env=env, capture_output=True, text=True)
+    assert result.returncode != 0 and 'publish=true' not in output.read_text()
+    print('PASS: Fedora publication refuses an untrusted latest tag')
 
 # Execute the real publication block against a stateful mock of immutable releases.
 publication = textwrap.dedent(workflow.split('      - name: Publish GitHub Release assets\n', 1)[1].split('        run: |\n', 1)[1])
@@ -191,6 +235,21 @@ with tempfile.TemporaryDirectory(prefix='iso-name-') as tmp:
         assert json.loads(archive.read('esphome-appliance/fedora-base.json')) == selection
     assert not list(output.glob('*.ign'))
     print('PASS: Ignition stays in the ZIP only; manifest covers every external package asset')
+
+# Attested inputs must describe the checked-out tag, not the scheduler's main SHA.
+assert 'id-token: write' in workflow and 'attestations: write' in workflow
+assert 'subject-path: build/release/*' in workflow
+predicate_type = 'https://github.com/Gunni/esphome-builder-vm-appliance/attestations/release-inputs/v1'
+assert 'predicate-type: ' + predicate_type in workflow
+record = textwrap.dedent(workflow.split('      - name: Record the verified release inputs\n', 1)[1].split('        run: |\n', 1)[1].split('      - name:', 1)[0])
+with tempfile.TemporaryDirectory(prefix='attested-inputs-') as tmp:
+    work = Path(tmp)
+    (work / '.ci').mkdir()
+    (work / '.ci/selection.json').write_text(json.dumps(selection))
+    env = {**os.environ, 'PATH': str(Path(sys.executable).parent) + ':' + os.environ['PATH'], 'SOURCE_COMMIT': 'a'*40, 'SOURCE_TAG': 'v1.0.0', 'GITHUB_SHA': 'b'*40}
+    subprocess.run(['bash', '-e', '-c', record], cwd=work, env=env, check=True)
+    assert json.loads((work / '.ci/release-inputs.json').read_text()) == {'source_commit': 'a'*40, 'source_tag': 'v1.0.0', 'fedora': selection}
+print('PASS: attestations bind all assets to the selected signed source and Fedora base')
 
 # Scheduled builds use the latest project tag, which may predate visible filenames.
 fetch_script = textwrap.dedent(workflow.split('      - name: Download or verify pinned Fedora ISO\n        run: |\n', 1)[1].split('      - name:', 1)[0])

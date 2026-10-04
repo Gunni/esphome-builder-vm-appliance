@@ -46,4 +46,4 @@ jobs:
           python tests/check_workflow.py
       - name: Lint GitHub workflows
         if: runner.os == 'Linux'
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes= .github/workflows/*.yml
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca -shellcheck= -pyflakes= .github/workflows/*.yml
