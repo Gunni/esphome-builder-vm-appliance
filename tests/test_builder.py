@@ -2,7 +2,7 @@ import base64
 import hashlib
 import io
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import runpy
 import os
 import shutil
@@ -242,8 +242,11 @@ class BuilderTests(unittest.TestCase):
         self.assertIn("SuccessAction=reboot", tools)
         self.assertNotIn("RemainAfterExit", tools)
         self.assertIn("StandardOutput=journal+console", tools)
-        self.assertIn("ConditionPathExists=!/var/lib/esphome/.packages-layered", tools)
-        self.assertIn("/var/lib/esphome/.packages-layered", files["/etc/esphome-appliance/packages-complete.conf"])
+        self.assertIn("ConditionPathExists=!/etc/esphome-appliance-release", tools)
+        self.assertNotIn(".packages-layered", json.dumps(dest))
+        self.assertIn("ExecStartPost=/usr/bin/mv -T /etc/esphome-appliance-release.pending /etc/esphome-appliance-release", tools)
+        self.assertIn("Requires=user-runtime-dir@2000.service", tools)
+        self.assertNotIn("Requires=user@2000.service", tools)
         self.assertNotIn(".packages-layered", files["/etc/tmpfiles.d/esphome-appliance.conf"])
         self.assertNotIn("run-esphomemetadata.mount", units)
         self.assertNotIn("esphome-hostname.service", units)
@@ -298,9 +301,23 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(account['shell'], '/usr/sbin/nologin')
         self.assertFalse(account.get('groups'))
         self.assertFalse(account.get('sshAuthorizedKeys'))
-        self.assertIn('/var/lib/systemd/linger/esphome', files)
+        # Every parent beneath HOME must belong to the rootless user, not just the leaf.
+        self.assertNotIn('directories', dest['storage'])
+        tmpfiles = files['/etc/tmpfiles.d/esphome-appliance.conf']
+        directories = {fields[1]: fields for line in tmpfiles.splitlines()
+                       if line.startswith('d ') for fields in [line.split()]}
+        for item in dest['storage']['files'] + dest['storage']['links']:
+            parent = PurePosixPath(item['path']).parent
+            while parent.is_relative_to('/var/home/esphome'):
+                self.assertEqual(directories[str(parent)][3:5], ['esphome', 'esphome'])
+                parent = parent.parent
+        self.assertNotIn('/var/lib/systemd/linger/esphome', files)
+        self.assertIn('f /var/lib/systemd/linger/esphome 0644 root root - -', tmpfiles)
         quadlet = files['/etc/containers/systemd/users/2000/esphome-builder.container']
-        self.assertIn('ConditionPathExists=/var/lib/esphome/.packages-layered', quadlet)
+        self.assertNotIn('ConditionPathExists=', quadlet)
+        manager = next(u for u in dest['systemd']['units'] if u['name'] == 'user@2000.service')
+        self.assertEqual(manager['dropins'][0]['contents'],
+                         '[Unit]\nRequires=esphome-tools.service\nAfter=esphome-tools.service\n')
         self.assertIn('WantedBy=default.target', quadlet)
         self.assertNotIn('esphome-tools.service', quadlet)
         self.assertNotIn('/etc/containers/systemd/esphome-builder.container', files)
@@ -311,14 +328,15 @@ class BuilderTests(unittest.TestCase):
             item = next(f for f in dest['storage']['files'] if f['path'] == path)
             self.assertEqual(base64.b64decode(item['append'][0]['source'].split(',', 1)[1]).decode(), 'esphome:524288:65536\n')
         for name in ('podman-auto-update.timer.d/10-appliance-schedule.conf', 'esphome-image-clean.timer'):
-            self.assertIn('ConditionPathExists=/var/lib/esphome/.packages-layered',
+            self.assertNotIn('ConditionPathExists=',
                           files['/var/home/esphome/.config/systemd/user/' + name])
         tmpfiles = files['/etc/tmpfiles.d/esphome-appliance.conf']
         for line in tmpfiles.splitlines():
             if line.startswith('d ') and line.split()[1] != '/var/lib/esphome':
                 self.assertEqual(line.split()[3:5], ['esphome', 'esphome'])
         self.assertIn('/usr/bin/run0 -u esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/local/bin/esphome-shell', B['ESPHOME_SHELL'])
-        self.assertIn('/etc/esphome-appliance-release', files)
+        self.assertNotIn('/etc/esphome-appliance-release', files)
+        self.assertIn('/etc/esphome-appliance-release.pending', files)
         self.assertNotIn('/etc/os-release', files)
         self.assertNotIn('/usr/lib/os-release', files)
 
@@ -498,6 +516,8 @@ class BuilderTests(unittest.TestCase):
         for a, b in [("local-fs.target", "systemd-tmpfiles-setup.service"),
                      ("systemd-tmpfiles-setup.service", "sysinit.target"),
                      ("sysinit.target", "basic.target"), ("sysinit.target", "timers.target"),
+                     ("basic.target", "user-runtime-dir@2000.service"),
+                     ("user-runtime-dir@2000.service", "user@2000.service"),
                      ("basic.target", "network.target"), ("network.target", "network-online.target"),
                      ("getty-pre.target", "getty@tty1.service"),
                      ("getty@tty1.service", "getty.target"), ("getty.target", "multi-user.target")]:

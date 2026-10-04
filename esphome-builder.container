@@ -1,6 +1,5 @@
 [Unit]
 Description=ESPHome dedicated remote builder
-ConditionPathExists=/var/lib/esphome/.packages-layered
 StartLimitIntervalSec=0
 
 [Container]

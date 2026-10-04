@@ -134,13 +134,8 @@ def configs(ssh_key, username, ntp_pools=None):
             for name, target in (
                 ('podman-auto-update.timer', '/usr/lib/systemd/user/podman-auto-update.timer'),
                 ('esphome-image-clean.timer', '../esphome-image-clean.timer'))
-        ], 'directories': [
-            {'path': '/var/home/esphome', 'mode': 0o700, 'user': {'name': 'esphome'}, 'group': {'name': 'esphome'}},
-            {'path': '/var/home/esphome/.config/systemd/user', 'mode': 0o755,
-             'user': {'name': 'esphome'}, 'group': {'name': 'esphome'}},
         ], 'files': [
-            file('/etc/esphome-appliance-release', 'NAME="ESPHome appliance"\nID=esphome-appliance\nVARIANT="Remote builder"\nVARIANT_ID=remote-builder\n'),
-            file('/var/lib/systemd/linger/esphome', ''),
+            file('/etc/esphome-appliance-release.pending', 'NAME="ESPHome appliance"\nID=esphome-appliance\nVARIANT="Remote builder"\nVARIANT_ID=remote-builder\n'),
             {'path': '/etc/subuid', 'append': [{'source': file('', 'esphome:524288:65536\n')['contents']['source']}]},
             {'path': '/etc/subgid', 'append': [{'source': file('', 'esphome:524288:65536\n')['contents']['source']}]},
             file('/etc/hostname', 'esphome-builder-????????????\n', overwrite=True),
@@ -163,7 +158,6 @@ def configs(ssh_key, username, ntp_pools=None):
             """).lstrip("\n")),
             file('/var/home/esphome/.config/systemd/user/esphome-image-clean.timer', dedent(r"""
                 [Unit]
-                ConditionPathExists=/var/lib/esphome/.packages-layered
                 Description=Weekly unused container image cleanup
                 [Timer]
                 OnCalendar=Sun *-*-* 05:30:00 UTC
@@ -173,7 +167,6 @@ def configs(ssh_key, username, ntp_pools=None):
             """).lstrip("\n")),
             file('/var/home/esphome/.config/systemd/user/podman-auto-update.timer.d/10-appliance-schedule.conf', dedent(r"""
                 [Unit]
-                ConditionPathExists=/var/lib/esphome/.packages-layered
                 Wants=esphome-builder.service
                 After=esphome-builder.service
                 [Timer]
@@ -184,8 +177,6 @@ def configs(ssh_key, username, ntp_pools=None):
                 Persistent=true
             """).lstrip("\n")),
             file('/etc/tmpfiles.d/esphome-appliance.conf', (HERE / 'esphome-tmpfiles.conf').read_text(encoding='utf-8')),
-            # Success markers must not be created by normal boot tmpfiles processing.
-            file('/etc/esphome-appliance/packages-complete.conf', 'f /var/lib/esphome/.packages-layered 0644 root root - -\n'),
             file('/etc/systemd/journald.conf.d/50-appliance-limits.conf', '[Journal]\nSystemMaxUse=256M\nRuntimeMaxUse=64M\nMaxRetentionSec=14day\n'),
             file('/etc/ssh/sshd_config.d/20-key-only.conf', 'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n'),
             file('/etc/polkit-1/rules.d/10-esphome-run0.rules', dedent(r"""
@@ -214,10 +205,10 @@ def configs(ssh_key, username, ntp_pools=None):
                 [Unit]
                 Description=Update appliance OS, layer tools and prepare ESPHome
                 Wants=network-online.target getty-pre.target
-                Requires=user@2000.service
-                After=network-online.target systemd-tmpfiles-setup.service user@2000.service
+                Requires=user-runtime-dir@2000.service
+                After=network-online.target systemd-tmpfiles-setup.service user-runtime-dir@2000.service
                 Before=multi-user.target getty-pre.target sshd.service zincati.service
-                ConditionPathExists=!/var/lib/esphome/.packages-layered
+                ConditionPathExists=!/etc/esphome-appliance-release
                 SuccessAction=reboot
                 [Service]
                 Type=oneshot
@@ -228,7 +219,7 @@ def configs(ssh_key, username, ntp_pools=None):
                 ExecStopPost=/usr/bin/busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager SetShowStatus s ""
                 StandardOutput=journal+console
                 StandardError=journal+console
-                ExecStartPost=/usr/bin/systemd-tmpfiles --create /etc/esphome-appliance/packages-complete.conf
+                ExecStartPost=/usr/bin/mv -T /etc/esphome-appliance-release.pending /etc/esphome-appliance-release
                 TimeoutStartSec=0
                 Restart=on-failure
                 RestartMode=direct
@@ -236,6 +227,9 @@ def configs(ssh_key, username, ntp_pools=None):
                 [Install]
                 WantedBy=multi-user.target
             """).lstrip("\n")),
+        ] + [
+            {'name': 'user@2000.service', 'dropins': [{'name': '10-appliance-setup.conf',
+                'contents': '[Unit]\nRequires=esphome-tools.service\nAfter=esphome-tools.service\n'}]}
         ] + [
             # agetty consumes this native credential; Fedora keeps its getty commands.
             {'name': name, 'dropins': [{'name': 'autologin.conf',
