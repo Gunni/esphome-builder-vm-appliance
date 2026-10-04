@@ -493,10 +493,14 @@ class BuilderTests(unittest.TestCase):
         units = {u['name']: u for u in dest['systemd']['units']}
         for name in ('getty@.service', 'serial-getty@.service'):
             contents = units[name]['dropins'][0]['contents']
-            self.assertEqual(contents, '[Service]\nSetCredential=agetty.autologin:operator\n')
-            self.assertNotIn('ExecStart', contents)
+            self.assertIn('[Service]\nExecStart=\n', contents)
+            self.assertIn('ExecStart=-/usr/bin/agetty --autologin operator --noclear ', contents)
+            self.assertTrue(contents.endswith('- ${TERM}\n'))
+            if name == 'serial-getty@.service':
+                self.assertIn('--keep-baud 115200,57600,38400,9600', contents)
+            self.assertNotIn('SetCredential=', contents)
             self.assertNotIn('enabled', units[name])
-        self.assertNotIn('agetty.autologin', json.dumps(B['generic_config']()['systemd']))
+        self.assertNotIn('--autologin', json.dumps(B['generic_config']()['systemd']))
 
     @unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "Needs Linux/POSIX bash")
     def test_guest_script_syntax(self):

@@ -74,7 +74,8 @@ function ssh-keygen { echo "Unexpected key validation" >&2; return 99; }
                         installed_units = {u['name']: u for u in dest['systemd']['units']}
                         for getty in ('getty@.service', 'serial-getty@.service'):
                             credential = installed_units[getty]['dropins'][0]['contents']
-                            self.assertEqual(credential, '[Service]\nSetCredential=agetty.autologin:builder\n')
+                            self.assertIn('--autologin builder ', credential)
+                            self.assertNotIn('@USERNAME@', credential)
                         self.assertEqual(user['sshAuthorizedKeys'], (ssh_key or data).splitlines())
                         if name.startswith('skip-ssh'):
                             self.assertEqual(user['sshAuthorizedKeys'], [])

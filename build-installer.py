@@ -231,10 +231,12 @@ def configs(ssh_key, username, ntp_pools=None):
             {'name': 'user@2000.service', 'dropins': [{'name': '10-appliance-setup.conf',
                 'contents': '[Unit]\nRequires=esphome-tools.service\nAfter=esphome-tools.service\n'}]}
         ] + [
-            # agetty consumes this native credential; Fedora keeps its getty commands.
+            # Explicit agetty autologin avoids dependence on credential delivery.
             {'name': name, 'dropins': [{'name': 'autologin.conf',
-                'contents': '[Service]\nSetCredential=agetty.autologin:' + username + '\n'}]}
-            for name in ('getty@.service', 'serial-getty@.service')
+                'contents': '[Service]\nExecStart=\nExecStart=-/usr/bin/agetty --autologin ' + username
+                            + ' --noclear ' + options + '- ${TERM}\n'}]}
+            for name, options in (('getty@.service', ''),
+                                  ('serial-getty@.service', '--keep-baud 115200,57600,38400,9600 '))
         ] + [
             # Local passwd accounts, local disks and Podman need none of these.
             {'name': 'systemd-homed.service', 'enabled': False, 'mask': True},
