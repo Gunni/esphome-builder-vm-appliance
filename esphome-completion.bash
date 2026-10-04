@@ -1,18 +1,23 @@
 # Bash completion delegates to the installed systemd completion functions.
 _esphome_complete() {
-    local helper=${COMP_WORDS[0]} command verb prefix
+    local helper=${COMP_WORDS[0]} command verb=${COMP_WORDS[1]-} prefix
+    if (( COMP_CWORD == 1 )); then
+        COMPREPLY=( $(compgen -W "logs start stop restart status update timers shell pairing disable-autologin help" -- "${COMP_WORDS[1]-}") )
+        return 0
+    fi
+    helper="$helper $verb"
     local -a COMP_WORDS=("${COMP_WORDS[@]}")
     local COMP_CWORD=$COMP_CWORD
     local COMP_LINE=${COMP_LINE-} COMP_POINT=${COMP_POINT:-0}
-    case $helper in
-        esphome-logs|esphome-pairing)
+    case $verb in
+        logs|pairing)
             command=journalctl
-            COMP_WORDS[0]=$command
+            COMP_WORDS=(journalctl "${COMP_WORDS[@]:2}")
+            ((COMP_CWORD -= 1))
             prefix=$command
             ;;
-        *)
+        start|stop|restart|status|update|timers)
             command=systemctl
-            verb=${helper#esphome-}
             local -a units=(esphome-builder.service)
             case $verb in
                 update) verb=start; units=(podman-auto-update.service) ;;
@@ -20,10 +25,11 @@ _esphome_complete() {
             esac
             # Complete flags and their values, not additional units from the admin's manager.
             [[ ${COMP_WORDS[COMP_CWORD]} == -* || ${COMP_WORDS[COMP_CWORD-1]} == -* ]] || return 0
-            COMP_WORDS=(systemctl --user "$verb" "${units[@]}" "${COMP_WORDS[@]:1}")
-            ((COMP_CWORD += 2 + ${#units[@]}))
+            COMP_WORDS=(systemctl --user "$verb" "${units[@]}" "${COMP_WORDS[@]:2}")
+            ((COMP_CWORD += 1 + ${#units[@]}))
             prefix="systemctl --user $verb ${units[*]}"
             ;;
+        *) return 0 ;;
     esac
     if [[ -n $COMP_LINE ]]; then
         COMP_LINE="$prefix${COMP_LINE:${#helper}}"
@@ -34,4 +40,4 @@ _esphome_complete() {
     declare -F "_$command" >/dev/null || return 0
     "_$command"
 }
-complete -F _esphome_complete esphome-pairing esphome-logs esphome-start esphome-stop esphome-restart esphome-status esphome-update esphome-timers
+complete -F _esphome_complete esphome

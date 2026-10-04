@@ -92,7 +92,7 @@ function ssh-keygen { echo "Fingerprint unavailable for fixture" >&2; return 99;
                             if name.startswith('skip-ssh'): self.assertFalse((root / 'curl-called').exists())
                         self.assertEqual('Linux system username:' in result.stdout, not bool(username))
                         self.assertEqual('GitHub username (' in result.stdout, not bool(ssh_key))
-                        motd = next(f for f in dest['storage']['files'] if f['path'] == '/etc/motd.d/20-esphome-appliance')
+                        motd = next(f for f in dest['storage']['files'] if f['path'] == '/etc/motd.d/20-esphome-appliance.motd')
                         text = base64.b64decode(motd['contents']['source'].split(',', 1)[1]).decode()
                         self.assertIn('Management user: builder', text)
                         self.assertNotIn('@USERNAME@', json.dumps(dest))

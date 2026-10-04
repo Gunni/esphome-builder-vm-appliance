@@ -1,5 +1,6 @@
 """Build a CoreOS appliance ISO using its documented Ignition embed area.
 Run with Python 3.11+: build-installer.py BASE_ISO OUTPUT_ISO [--env SETTINGS].
+Verify without rebuilding: build-installer.py verify BASE_ISO APPLIANCE_ISO
 Only the reserved Ignition area is modified; original stays intact.
 """
 import argparse
@@ -10,6 +11,7 @@ import lzma
 from pathlib import Path
 import re
 import struct
+import sys
 from textwrap import dedent
 
 HERE = Path(__file__).resolve().parent
@@ -28,6 +30,8 @@ def file(path, content, mode=0o644, overwrite=False):
 def unit(name, content):
     return {'name': name, 'enabled': True, 'contents': content}
 
+ABSOLUTE_MIN_DISK_GIB = 10  # CoreOS root needs 8 GiB; leave room for boot/EFI partitions.
+
 DEFAULT_NTP_POOLS = tuple(f"{number}.pool.ntp.org" for number in (2, 0, 1, 3))
 
 CHRONY = ("# Global NTP pools. Chrony selects sources based on measured quality.\n"
@@ -43,7 +47,7 @@ ESPHOME_SHELL = dedent(r"""
     #!/usr/bin/bash
     set -euo pipefail
     if [ "$(id -un)" != esphome ]; then
-        exec /usr/bin/run0 -u esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/local/bin/esphome-shell
+        exec /usr/bin/run0 -u esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/local/bin/esphome shell
     fi
     exec /usr/bin/podman exec --interactive --tty --workdir /config esphome-builder /bin/bash -c '
         while IFS= read -r -d "" setting; do
@@ -56,8 +60,8 @@ ESPHOME_SHELL = dedent(r"""
 ESPHOME_PAIRING = dedent(r"""
     #!/usr/bin/bash
     set -euo pipefail
-    /usr/local/bin/esphome-start
-    exec /usr/local/bin/esphome-logs --follow --lines=30 "$@"
+    /usr/local/bin/esphome start
+    exec /usr/local/bin/esphome logs --follow --lines=30 "$@"
 """).lstrip("\n")
 
 DISABLE_AUTOLOGIN = dedent(r"""
@@ -65,7 +69,7 @@ DISABLE_AUTOLOGIN = dedent(r"""
     set -euo pipefail
     /usr/bin/rm -f -- /etc/systemd/system/{getty@,serial-getty@}.service.d/autologin.conf
     /usr/bin/systemctl daemon-reload
-    /usr/bin/rm -f -- /usr/local/bin/esphome-disable-autologin
+    /usr/bin/rm -f -- /usr/local/libexec/esphome-disable-autologin
 """).lstrip("\n")
 
 # Thin wrappers keep the correct journal filters and user-manager scope in one place.
@@ -76,6 +80,17 @@ ESPHOME_COMMANDS = {
     'esphome-update': '/usr/bin/run0 -u esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/bin/systemctl --user start podman-auto-update.service',
     'esphome-timers': '/usr/bin/run0 -u esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/bin/systemctl --user list-timers podman-auto-update.timer esphome-image-clean.timer',
 }
+
+def command_helper():
+    bodies = {**{name.removeprefix('esphome-'): 'exec ' + command + ' "$@"' for name, command in ESPHOME_COMMANDS.items()},
+              'shell': ESPHOME_SHELL.split('set -euo pipefail\n', 1)[1],
+              'pairing': ESPHOME_PAIRING.split('set -euo pipefail\n', 1)[1],
+              'disable-autologin': 'exec /usr/bin/run0 /usr/local/libexec/esphome-disable-autologin "$@"'}
+    help_text = 'Usage: esphome {' + '|'.join(bodies) + '} [arguments]'
+    return ('#!/usr/bin/bash\nset -euo pipefail\ncommand=${1:-help}\n(( $# == 0 )) || shift\ncase "$command" in\n'
+            + ''.join(f'{name})\n{body}\n;;\n' for name, body in bodies.items())
+            + f'help|-h|--help) echo "{help_text}" ;;\n*) echo "Unknown command: $command" >&2; echo "{help_text}" >&2; exit 2 ;;\nesac\n')
+
 
 INSTALL = dedent(r"""
     #!/usr/bin/bash
@@ -97,8 +112,9 @@ INSTALL = dedent(r"""
     [ -n "$disk" ] || refuse 'no writable non-removable disk found'
     (( ties == 1 )) || refuse 'multiple disks share the largest size'
     test -b "$disk" || refuse 'selected device is not a block device'
-    if (( bytes < 50 * 1024 * 1024 * 1024 || bytes > 80 * 1024 * 1024 * 1024 )); then
-        refuse "$disk is outside expected 50-80 GiB range; use a disk within those bounds or rebuild the ISO with MIN_DISK_GIB/MAX_DISK_GIB in .env"
+    size_gib=$(awk -v bytes="$bytes" 'BEGIN {printf "%.2f", bytes / 1073741824}')
+    if (( bytes < @ABSOLUTE_MIN_DISK_GIB@ * 1024 * 1024 * 1024 )); then
+        refuse "$disk is $size_gib GiB ($bytes bytes); the appliance requires at least @ABSOLUTE_MIN_DISK_GIB@ GiB for the OS and boot partitions. Enlarge the VM disk; this minimum cannot be overridden."
     fi
     nodes=$(lsblk --noheadings --raw --paths --output NAME,TYPE "$disk")
     while read -r node type; do
@@ -107,6 +123,14 @@ INSTALL = dedent(r"""
     mounts=$(lsblk --noheadings --raw --output MOUNTPOINTS "$disk")
     [[ "$mounts" =~ ^[[:space:]]*$ ]] || refuse "$disk is mounted or used as swap"
     signatures=$(wipefs --no-act --noheadings --output TYPE "$disk")
+    if (( bytes < 50 * 1024 * 1024 * 1024 || bytes > 2048 * 1024 * 1024 * 1024 )); then
+        echo "Warning: selected disk $disk is $size_gib GiB ($bytes bytes), outside the recommended 50-2048 GiB range."
+        echo 'Small disks may run out of space during container setup, builds or OS updates. Large disks may indicate the wrong device.'
+        echo 'Use a larger disk if needed, or set the recommended range with MIN_DISK_GIB/MAX_DISK_GIB in .env when rebuilding.'
+        printf 'To use this disk anyway, type USE %s (anything else cancels): ' "$disk"
+        read -r confirmation || refuse 'disk size warning was not acknowledged; no disk was written'
+        [ "$confirmation" = "USE $disk" ] || refuse 'disk size warning was not acknowledged; no disk was written'
+    fi
     if [[ "$nodes" != "$disk disk" || -n "$signatures" ]]; then
         echo "Selected non-empty disk: $disk ($bytes bytes). Existing contents will be overwritten."
         printf '%s\n' "$nodes" "$signatures"
@@ -127,6 +151,8 @@ INSTALL = dedent(r"""
     coreos-installer install "$disk" --offline --ignition-file /run/esphome/installed.ign
     echo 'Installation complete. Eject installer ISO; systemd will reboot.'
 """).lstrip("\n")
+
+INSTALL = INSTALL.replace('@ABSOLUTE_MIN_DISK_GIB@', str(ABSOLUTE_MIN_DISK_GIB))
 
 def configs(ssh_key, username, ntp_pools=None):
     chrony = CHRONY
@@ -158,10 +184,9 @@ def configs(ssh_key, username, ntp_pools=None):
             file('/etc/hostname', 'esphome-builder-????????????\n', overwrite=True),
             file('/etc/vconsole.conf', 'KEYMAP=us\n', overwrite=True),
             file('/etc/chrony.conf', chrony, overwrite=True),
-            file('/etc/motd.d/20-esphome-appliance', (HERE / 'motd.txt').read_text(encoding='utf-8').replace('@USERNAME@', username).replace('@NTP_POOLS@', ' '.join(ntp_pools or DEFAULT_NTP_POOLS))),
+            file('/etc/motd.d/20-esphome-appliance.motd', (HERE / 'motd.txt').read_text(encoding='utf-8').replace('@USERNAME@', username).replace('@NTP_POOLS@', ' '.join(ntp_pools or DEFAULT_NTP_POOLS))),
             file('/etc/bash_completion.d/esphome-appliance', (HERE / 'esphome-completion.bash').read_text(encoding='utf-8')),
-            file('/usr/local/bin/esphome-shell', ESPHOME_SHELL, mode=0o755),
-            file('/usr/local/bin/esphome-pairing', ESPHOME_PAIRING, mode=0o755),
+            file('/usr/local/bin/esphome', command_helper(), mode=0o755),
             file('/etc/systemd/user/esphome-start-paired.service', dedent(r"""
                 [Unit]
                 Description=Start ESPHome only with an existing approved pairing
@@ -172,9 +197,7 @@ def configs(ssh_key, username, ntp_pools=None):
                 ExecCondition=/usr/bin/jq --exit-status '(.peers | type == "array" and length > 0) and all(.peers[]; (.dashboard_id | type == "string" and length > 0) and (.static_x25519_pub | type == "string" and (gsub("[[:space:]]"; "") | test("^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"))) and (.label | type == "string") and (.pin_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and (.paired_at | type == "number"))' /var/lib/esphome/config/.receiver_peers.json
                 ExecStart=/usr/bin/systemctl --user start esphome-builder.service
             """).lstrip("\n")),
-            file('/usr/local/bin/esphome-disable-autologin', DISABLE_AUTOLOGIN, mode=0o755),
-            *[file('/usr/local/bin/' + name, '#!/usr/bin/bash\nexec ' + command + ' "$@"\n', mode=0o755)
-              for name, command in ESPHOME_COMMANDS.items()],
+            file('/usr/local/libexec/esphome-disable-autologin', DISABLE_AUTOLOGIN, mode=0o755),
             file('/etc/containers/systemd/users/2000/esphome-builder.container', (HERE / 'esphome-builder.container').read_text(encoding='utf-8')),
             file('/var/home/esphome/.config/systemd/user/esphome-image-clean.service', dedent(r"""
                 [Unit]
@@ -338,7 +361,7 @@ PROVISION = dedent(r"""
         echo 'Using public SSH key supplied at build time.'
     fi
     template=/etc/esphome-appliance/template.ign
-    motd=$(jq -r '.storage.files[] | select(.path == "/etc/motd.d/20-esphome-appliance") | .contents.source' "$template")
+    motd=$(jq -r '.storage.files[] | select(.path == "/etc/motd.d/20-esphome-appliance.motd") | .contents.source' "$template")
     motd=$(printf '%s' "${motd#data:;base64,}" | base64 -d | sed "s/@USERNAME@/$username/g" | base64 -w0)
     umask 077
     jq --arg user "$username" --rawfile keys /run/esphome/github.keys --arg motd "$motd" '
@@ -346,7 +369,7 @@ PROVISION = dedent(r"""
             .name = $user | .sshAuthorizedKeys = ($keys | split("\n") | map(select(length > 0))) end)
         | .systemd.units |= map(if .name == "getty@.service" or .name == "serial-getty@.service" then
             .dropins |= map(.contents |= gsub("@USERNAME@"; $user)) else . end)
-        | .storage.files |= map(if .path == "/etc/motd.d/20-esphome-appliance" then
+        | .storage.files |= map(if .path == "/etc/motd.d/20-esphome-appliance.motd" then
             .contents.source = ("data:;base64," + $motd) else . end)
     ' "$template" > /run/esphome/installed.ign
     echo "Settings ready: user $username."
@@ -365,9 +388,9 @@ def generic_config(username="", ssh_key="", serial_console=False, **settings):
                  json.dumps({'username': username, 'ssh_key': ssh_key}), 0o600),
             file('/usr/local/bin/provision-esphome-appliance', PROVISION, 0o755),
             file('/usr/local/bin/install-esphome-appliance', INSTALL.replace('50 * 1024',
-                str(settings.get('min_disk_gib', 50)) + ' * 1024').replace('80 * 1024',
-                str(settings.get('max_disk_gib', 80)) + ' * 1024').replace('50-80 GiB',
-                str(settings.get('min_disk_gib', 50)) + '-' + str(settings.get('max_disk_gib', 80)) + ' GiB').replace(
+                str(settings.get('min_disk_gib', 50)) + ' * 1024').replace('2048 * 1024',
+                str(settings.get('max_disk_gib', 2048)) + ' * 1024').replace('50-2048 GiB',
+                str(settings.get('min_disk_gib', 50)) + '-' + str(settings.get('max_disk_gib', 2048)) + ' GiB').replace(
                 '--ignition-file /run/esphome/installed.ign',
                 '--ignition-file /run/esphome/installed.ign' +
                 (' --console tty0 --console ttyS0,115200' if serial_console else '')), 0o755),
@@ -465,6 +488,11 @@ def cpio_entry(name, data, inode):
     part += data
     return part + bytes((-len(data)) % 4)
 
+def ignition_archive(data):
+    archive = cpio_entry('config.ign', data, 1) + cpio_entry('TRAILER!!!', b'', 2)
+    return archive + bytes((-len(archive)) % 512)
+
+
 def extract_config(blob):
     decoder = lzma.LZMADecompressor()
     raw = decoder.decompress(blob)
@@ -474,7 +502,41 @@ def extract_config(blob):
     length, namesize = fields[6], fields[11]
     require(raw[110:110+namesize] == b'config.ign\0', 'ISO validation failed')
     start = (110 + namesize + 3) & ~3
-    return raw[start:start+length]
+    data = raw[start:start+length]
+    require(raw == ignition_archive(data), 'Unexpected files or metadata in embedded Ignition archive')
+    require(not decoder.unused_data.strip(b'\0'), 'Unexpected data after embedded Ignition archive')
+    return data
+
+def verify_iso(source, customized, expected_config=None):
+    """Return readable Ignition after validating the original and every outside byte."""
+    source, customized = Path(source), Path(customized)
+    require(source.is_file() and customized.is_file(), 'Both ISO files must exist')
+    require(source.resolve() != customized.resolve(), 'Original and appliance ISO must be separate')
+    require(source.stat().st_size == customized.stat().st_size, 'Output length changed')
+    with source.open('rb') as original, customized.open('rb') as built:
+        offset, size = find_embed(original)
+        require(size > 0 and offset + size <= source.stat().st_size, 'Invalid Ignition embed area')
+        require(find_embed(built) == (offset, size), 'Embed location changed')
+        original.seek(offset)
+        require(original.read(size) == bytes(size), 'Base ISO already customized')
+        built.seek(offset)
+        config = json.loads(extract_config(built.read(size)))
+        require(isinstance(config, dict) and isinstance(config.get('ignition'), dict)
+                and isinstance(config['ignition'].get('version'), str), 'Invalid embedded Ignition configuration')
+        if expected_config is not None:
+            require(config == expected_config, 'Embedded Ignition verification failed')
+        original.seek(0); built.seek(0)
+        position = 0
+        while a := original.read(4 * 1024 * 1024):
+            b = built.read(len(a))
+            left, right = max(0, offset - position), min(len(a), offset + size - position)
+            if left < right:
+                require(a[:left] == b[:left] and a[right:] == b[right:], 'ISO bytes outside reserved areas changed')
+            else:
+                require(a == b, 'ISO bytes outside reserved areas changed')
+            position += len(a)
+    return config
+
 
 def build_iso(source, output, **settings):
     source, output = Path(source).resolve(), Path(output).resolve()
@@ -487,8 +549,7 @@ def build_iso(source, output, **settings):
     require(isinstance(settings.get('serial_console', False), bool), 'SERIAL_CONSOLE must be a boolean')
     live = generic_config(**settings)
     data = json.dumps(live).encode()
-    archive = cpio_entry('config.ign', data, 1) + cpio_entry('TRAILER!!!', b'', 2)
-    archive += bytes((-len(archive)) % 512)
+    archive = ignition_archive(data)
     compressed = lzma.compress(archive, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC32)
     with source.open('rb') as fp:
         offset, size = find_embed(fp)
@@ -496,7 +557,6 @@ def build_iso(source, output, **settings):
         fp.seek(offset)
         require(fp.read(size) == bytes(size), 'Base ISO already customized')
     require(len(compressed) <= size, 'Ignition exceeds the reserved embed area')
-    mutable_ranges = [(offset, offset + size)]
     created_iso = created_checksum = False
     try:
         # Exclusive creation prevents accidentally overwriting an existing file.
@@ -507,26 +567,7 @@ def build_iso(source, output, **settings):
         with output.open('r+b') as fp:
             fp.seek(offset)
             fp.write(compressed + bytes(size - len(compressed)))
-        with output.open('rb') as fp:
-            require(find_embed(fp) == (offset, size), 'Embed location changed')
-            fp.seek(offset)
-            require(extract_config(fp.read(size)) == data, 'Embedded Ignition verification failed')
-        # Every byte outside the reserved Ignition area must remain unchanged.
-        with source.open('rb') as original, output.open('rb') as customized:
-            position = 0
-            while True:
-                a, b = original.read(4 * 1024 * 1024), customized.read(4 * 1024 * 1024)
-                if not a:
-                    require(not b, 'Output length changed')
-                    break
-                start = 0
-                for left, right in mutable_ranges:
-                    left, right = max(0, left - position), min(len(a), right - position)
-                    if left < right:
-                        require(a[start:left] == b[start:left], 'ISO bytes outside reserved areas changed')
-                        start = right
-                require(a[start:] == b[start:], 'ISO bytes outside reserved areas changed')
-                position += len(a)
+        verify_iso(source, output, expected_config=live)
         with output.open('rb') as fp:
             digest = hashlib.file_digest(fp, 'sha256').hexdigest()
         with checksum.open('x', encoding='utf-8', newline='\n') as fp:
@@ -561,8 +602,9 @@ def read_settings(path):
             value = value[1:-1]
         result[key] = value
     minimum = int(result.get('MIN_DISK_GIB', '50'))
-    maximum = int(result.get('MAX_DISK_GIB', '80'))
-    require(1 <= minimum <= maximum <= 65536, 'Disk bounds must be positive and MIN_DISK_GIB <= MAX_DISK_GIB')
+    maximum = int(result.get('MAX_DISK_GIB', '2048'))
+    require(ABSOLUTE_MIN_DISK_GIB <= minimum <= maximum <= 65536,
+            f'Recommended bounds must satisfy {ABSOLUTE_MIN_DISK_GIB} <= MIN_DISK_GIB <= MAX_DISK_GIB <= 65536')
     pools = result.get('NTP_POOLS', ' '.join(DEFAULT_NTP_POOLS)).split()
     require(pools and all(re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}', pool) for pool in pools),
             'NTP_POOLS must be a space-separated list of NTP hostnames or IPv4 addresses')
@@ -577,18 +619,31 @@ def read_settings(path):
 
 
 def main():
+    verify = len(sys.argv) > 1 and sys.argv[1] == 'verify'
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('base_iso', help='Unmodified Fedora CoreOS stable x86_64 Live DVD ISO')
-    parser.add_argument('output_iso', help='New customized .iso file; never overwritten')
-    parser.add_argument('--env', type=Path, help='Optional build settings: disk bounds, NTP pools, Linux username, public SSH key and optional serial console')
-    args = parser.parse_args()
+    parser.add_argument('output_iso', help='Appliance ISO to verify' if verify else 'New customized .iso file; never overwritten')
+    if verify:
+        parser.add_argument('--ignition', type=Path, help='Expected embedded live Ignition JSON to compare')
+        parser.add_argument('--extract-ignition', type=Path, help='Save readable embedded Ignition to a new file after verification')
+    else:
+        parser.add_argument('--env', type=Path, help='Optional build settings: disk bounds, NTP pools, account defaults and serial console')
+    args = parser.parse_args(sys.argv[2:] if verify else None)
     try:
-        settings = read_settings(args.env) if args.env else {}
-        digest = build_iso(args.base_iso, args.output_iso, **settings)
+        if verify:
+            expected = json.loads(args.ignition.read_text(encoding='utf-8')) if args.ignition else None
+            config = verify_iso(args.base_iso, args.output_iso, expected_config=expected)
+            if args.extract_ignition:
+                with args.extract_ignition.open('x', encoding='utf-8', newline='\n') as fp:
+                    fp.write(json.dumps(config, indent=2) + '\n')
+            print('Verified original ISO bytes outside the reserved Ignition area.'
+                  + (' Embedded configuration matches expected JSON.' if expected is not None else ' Inspect embedded Ignition before trusting its instructions.'))
+        else:
+            settings = read_settings(args.env) if args.env else {}
+            digest = build_iso(args.base_iso, args.output_iso, **settings)
+            print(f'Created {Path(args.output_iso).resolve()}\nVerified embedded Ignition and every ISO byte outside its reserved area.\nSHA256: {digest}')
     except (OSError, ValueError, EOFError, lzma.LZMAError) as error:
-        parser.exit(1, f'Build failed: {error}\n')
-    print(f'Created {Path(args.output_iso).resolve()}\n'
-          f'Verified embedded Ignition and every ISO byte outside its reserved area.\nSHA256: {digest}')
+        parser.exit(1, f'{"Verification" if verify else "Build"} failed: {error}\n')
 
 
 if __name__ == '__main__':

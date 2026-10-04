@@ -56,7 +56,7 @@ fi
                 ("mounted", f"{large} {size} disk 0 0\n", str(large), "/", "", False),
                 ("opaque-leftover-data", f"{large} {size} disk 0 0\n", str(large), "", "", True),
                 ("tied-largest", f"{large} {size} disk 0 0\n{small} {size} disk 0 0\n", str(large), "", "", False),
-                ("out-of-range", f"{large} {size*4} disk 0 0\n", str(large), "", "", False),
+                ("out-of-range", f"{large} {size*64} disk 0 0\n", str(large), "", "", False),
                 ("read-only", f"{large} {size} disk 1 0\n", str(large), "", "", False),
                 ("removable", f"{large} {size} disk 0 1\n", str(large), "", "", False),
                 ("occupied-largest-no-fallback", f"{large} {size} disk 0 0\n{small} {size-1} disk 0 0\n", str(large), "", "ext4", False),
@@ -70,6 +70,15 @@ fi
                 ("confirmed-mounted-refused", f"{large} {size} disk 0 0\n", str(large), "/", "gpt", False, f"ERASE {large}\n"),
                 ("confirmed-swap-refused", f"{large} {size} disk 0 0\n", str(large), "[SWAP]", "gpt", False, f"ERASE {large}\n"),
             ]
+            for gib in (10, 32, 4096):
+                cases.append((f'size-warning-{gib}', f'{large} {gib * 1024**3} disk 0 0\n', str(large), '', '', True, f'USE {large}\n'))
+            cases.extend([
+                ('absolute-minimum', f'{large} {9 * 1024**3} disk 0 0\n', str(large), '', '', False, f'USE {large}\n'),
+                ('size-warning-declined', f'{large} {32 * 1024**3} disk 0 0\n', str(large), '', '', False, '\n'),
+                ('size-warning-wrong-device', f'{large} {32 * 1024**3} disk 0 0\n', str(large), '', '', False, f'USE {small}\n'),
+                ('size-and-erase-confirmed', f'{large} {32 * 1024**3} disk 0 0\n', str(large), '', 'gpt', True, f'USE {large}\nERASE {large}\n'),
+                ('size-confirmation-not-erase', f'{large} {32 * 1024**3} disk 0 0\n', str(large), '', 'gpt', False, f'USE {large}\n'),
+            ])
             for race in ('nodes', 'mounts', 'signatures'):
                 cases.append(('race-' + race, f"{large} {size} disk 0 0\n", str(large), '', 'gpt', False, f"ERASE {large}\n"))
             for name, inventory, nodes, mounts, signatures, expected, stdin in cases:
@@ -83,9 +92,14 @@ fi
                     large.write_bytes(b'unrecognized leftover data' if name == 'opaque-leftover-data' else b'')
                     marker = root / "installed"; marker.unlink(missing_ok=True)
                     env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
-                               FIXTURE=str(root), DISK_SIZE=str(size))
+                               FIXTURE=str(root), DISK_SIZE=inventory.splitlines()[0].split()[1])
                     result = subprocess.run(["bash", str(script)], env=env, input=stdin, text=True, capture_output=True)
                     self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
                     self.assertEqual(marker.exists(), expected)
                     self.assertFalse((root / 'full-disk-scan').exists(), 'Installer must not scan the entire disk')
                     if expected: self.assertIn(str(large), marker.read_text())
+                    if name == 'absolute-minimum':
+                        self.assertIn('9.00 GiB', result.stderr)
+                        self.assertIn('at least 10 GiB', result.stderr)
+                    if name.startswith('size-warning'):
+                        self.assertIn('Warning: selected disk', result.stdout)

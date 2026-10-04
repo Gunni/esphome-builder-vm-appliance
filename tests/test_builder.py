@@ -186,9 +186,39 @@ class BuilderTests(unittest.TestCase):
         self.assertIn("pool 2.pool.ntp.org iburst", chrony)
         self.assertNotIn(".is.pool.ntp.org", chrony)
 
+    def test_standalone_verifier_and_cli(self):
+        import sys
+        source, output = self.root / 'original.iso', self.root / 'appliance.iso'
+        offset, size = synthetic_iso(source)
+        B['build_iso'](source, output, username='operator')
+        expected = B['generic_config'](username='operator')
+        self.assertEqual(B['verify_iso'](source, output, expected), expected)
+        with self.assertRaisesRegex(ValueError, 'Embedded Ignition'):
+            B['verify_iso'](source, output, B['generic_config']())
+        expected_file, extracted = self.root / 'expected.ign', self.root / 'inspect.ign'
+        expected_file.write_text(json.dumps(expected, indent=2))
+        command = [sys.executable, str(ROOT / 'build-installer.py'), 'verify', str(source), str(output), '--ignition', str(expected_file), '--extract-ignition', str(extracted)]
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(extracted.read_text()), expected)
+        # Inspection output is exclusive: a second invocation cannot overwrite it.
+        self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
+        before = output.read_bytes()
+        for changed in (before[:-1], b'X' + before[1:], before[:offset] + bytes(size) + before[offset+size:]):
+            output.write_bytes(changed)
+            with self.assertRaises((ValueError, EOFError, B['lzma'].LZMAError)):
+                B['verify_iso'](source, output)
+        output.write_bytes(before)
+        # An additional embedded file must not hide behind the readable first config.
+        archive = B['cpio_entry']('config.ign', json.dumps(expected).encode(), 1) + B['cpio_entry']('extra', b'not allowed', 2) + B['cpio_entry']('TRAILER!!!', b'', 3)
+        compressed = B['lzma'].compress(archive)
+        output.write_bytes(before[:offset] + compressed + bytes(size-len(compressed)) + before[offset+size:])
+        with self.assertRaisesRegex(ValueError, 'Unexpected files'):
+            B['verify_iso'](source, output)
+
     def test_invalid_settings(self):
         env = self.root / '.env'
-        for bad in ['USERNAME=root', 'USERNAME=esphome', 'USERNAME=bad/name', 'SSH_KEY_FILE=key.pub', 'PLATFORM=hyperv',
+        for bad in ['MIN_DISK_GIB=9', 'USERNAME=root', 'USERNAME=esphome', 'USERNAME=bad/name', 'SSH_KEY_FILE=key.pub', 'PLATFORM=hyperv',
                     'INSTALL_DEVICE=/dev/sda', 'MIN_DISK_GIB=90\nMAX_DISK_GIB=80',
                     'NTP_POOLS="x;touch"', 'NTP_POOLS="unclosed', 'UNKNOWN=x',
                     'MIN_DISK_GIB=50\nMIN_DISK_GIB=60']:
@@ -218,8 +248,8 @@ class BuilderTests(unittest.TestCase):
         files = decode_files(dest)
         live_files = decode_files(B["generic_config"](min_disk_gib=60, max_disk_gib=100))
         self.assertEqual(files["/etc/hostname"], "esphome-builder-????????????\n")
-        self.assertIn("Management user: builder", files["/etc/motd.d/20-esphome-appliance"])
-        self.assertNotIn("@NTP_POOLS@", files["/etc/motd.d/20-esphome-appliance"])
+        self.assertIn("Management user: builder", files["/etc/motd.d/20-esphome-appliance.motd"])
+        self.assertNotIn("@NTP_POOLS@", files["/etc/motd.d/20-esphome-appliance.motd"])
         self.assertIn("pool 0.pool.ntp.org iburst", files["/etc/chrony.conf"])
         self.assertIn("wipefs --no-act", live_files["/usr/local/bin/install-esphome-appliance"])
         self.assertIn("60-100 GiB", live_files["/usr/local/bin/install-esphome-appliance"])
@@ -270,7 +300,7 @@ class BuilderTests(unittest.TestCase):
             result = subprocess.run(['bash', '-c', command], input='printf "%s\\n" "$ESPHOME_BUILD_PATH" "$PLATFORMIO_PACKAGES_DIR" "$CCACHE_DIR" "$VALUE_WITH_SPACES"\n', text=True, capture_output=True, check=True)
             self.assertEqual(result.stdout.splitlines(), ['/build', '/cache/platformio/packages', '/ccache', 'keep spaces $literal'])
             dest = B['configs']('ssh-ed25519 TEST', 'operator')
-            helper = next(f for f in dest['storage']['files'] if f['path'] == '/usr/local/bin/esphome-shell')
+            helper = next(f for f in dest['storage']['files'] if f['path'] == '/usr/local/bin/esphome')
             self.assertEqual(helper['mode'], 0o755)
             self.assertIn('--workdir /config esphome-builder', B['ESPHOME_SHELL'])
 
@@ -286,7 +316,7 @@ class BuilderTests(unittest.TestCase):
             args = result.stdout.splitlines()
             if username == 'operator':
                 self.assertEqual(args, ['-u', 'esphome',
-                                       '--setenv=XDG_RUNTIME_DIR=/run/user/2000', '/usr/local/bin/esphome-shell'])
+                                       '--setenv=XDG_RUNTIME_DIR=/run/user/2000', '/usr/local/bin/esphome', 'shell'])
             else:
                 self.assertEqual(args[:6], ['exec', '--interactive', '--tty', '--workdir', '/config', 'esphome-builder'])
                 self.assertNotIn('/usr/bin/run0', args)
@@ -302,8 +332,9 @@ class BuilderTests(unittest.TestCase):
         # Every parent beneath HOME must belong to the rootless user, not just the leaf.
         self.assertNotIn('directories', dest['storage'])
         tmpfiles = files['/etc/tmpfiles.d/esphome-appliance.conf']
-        directories = {fields[1]: fields for line in tmpfiles.splitlines()
-                       if line.startswith('d ') for fields in [line.split()]}
+        rules = [line.split() for line in tmpfiles.splitlines()
+                 if line.strip() and not line.lstrip().startswith('#')]
+        directories = {fields[1]: fields for fields in rules if fields[0] == 'd'}
         for name in ('config', 'cache', 'build', 'ccache'):
             self.assertEqual(directories['/var/lib/esphome/' + name][2:5],
                              ['0700', 'esphome', 'esphome'])
@@ -313,7 +344,7 @@ class BuilderTests(unittest.TestCase):
                 self.assertEqual(directories[str(parent)][3:5], ['esphome', 'esphome'])
                 parent = parent.parent
         self.assertNotIn('/var/lib/systemd/linger/esphome', files)
-        self.assertIn('f /var/lib/systemd/linger/esphome 0644 root root - -', tmpfiles)
+        self.assertIn(['f', '/var/lib/systemd/linger/esphome', '0644', 'root', 'root', '-', '-'], rules)
         quadlet = files['/etc/containers/systemd/users/2000/esphome-builder.container']
         self.assertNotIn('ConditionPathExists=', quadlet)
         manager = next(u for u in dest['systemd']['units'] if u['name'] == 'user@2000.service')
@@ -334,10 +365,10 @@ class BuilderTests(unittest.TestCase):
             self.assertNotIn('ConditionPathExists=',
                           files['/var/home/esphome/.config/systemd/user/' + name])
         tmpfiles = files['/etc/tmpfiles.d/esphome-appliance.conf']
-        for line in tmpfiles.splitlines():
-            if line.startswith('d ') and line.split()[1] != '/var/lib/esphome':
-                self.assertEqual(line.split()[3:5], ['esphome', 'esphome'])
-        self.assertIn('/usr/bin/run0 -u esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/local/bin/esphome-shell', B['ESPHOME_SHELL'])
+        for fields in directories.values():
+            if fields[1] not in ('/var/lib/esphome', '/usr/local/libexec'):
+                self.assertEqual(fields[3:5], ['esphome', 'esphome'])
+        self.assertIn('/usr/bin/run0 -u esphome --setenv=XDG_RUNTIME_DIR=/run/user/2000 /usr/local/bin/esphome shell', B['ESPHOME_SHELL'])
         self.assertNotIn('/etc/esphome-appliance-release', files)
         self.assertIn('/etc/esphome-appliance-release.pending', files)
         self.assertNotIn('/etc/os-release', files)
@@ -347,6 +378,9 @@ class BuilderTests(unittest.TestCase):
     def test_command_helpers_forward_arguments_and_exit_status(self):
         dest = B['configs'](KEY, 'operator')
         files = decode_files(dest)
+        self.assertIn('/usr/local/bin/esphome', files)
+        for verb in ('logs', 'start', 'stop', 'restart', 'status', 'shell', 'pairing', 'update', 'timers'):
+            self.assertNotIn('/usr/local/bin/esphome-' + verb, files)
         mock = self.root / 'run0'
         mock.write_text('#!/bin/bash\nprintf "%s\\0" "$@"\nexit "${HELPER_EXIT:-0}"\n')
         mock.chmod(0o755)
@@ -360,12 +394,12 @@ class BuilderTests(unittest.TestCase):
         forwarded = ['--since', '2026-10-03 12:00:00', 'literal $value; no expansion']
         for verb, expected in cases.items():
             with self.subTest(verb=verb):
-                path = '/usr/local/bin/esphome-' + verb
+                path = '/usr/local/bin/esphome'
                 helper = next(f for f in dest['storage']['files'] if f['path'] == path)
                 self.assertEqual(helper['mode'], 0o755)
                 script = self.root / ('esphome-' + verb)
                 script.write_text(files[path].replace('/usr/bin/run0', str(mock)))
-                result = subprocess.run(['bash', str(script), *forwarded], capture_output=True,
+                result = subprocess.run(['bash', str(script), verb, *forwarded], capture_output=True,
                                         env=dict(os.environ, HELPER_EXIT='23'))
                 self.assertEqual(result.returncode, 23)
                 args = result.stdout.decode().split('\0')[:-1]
@@ -396,11 +430,11 @@ class BuilderTests(unittest.TestCase):
         start.write_text('#!/bin/bash\nexit "${START_EXIT:-0}"\n'); start.chmod(0o755)
         logs.write_text('#!/bin/bash\nprintf "%s\\0" "$@"\n'); logs.chmod(0o755)
         helper = self.root / 'pairing'
-        helper.write_text(files['/usr/local/bin/esphome-pairing'].replace('/usr/local/bin/esphome-start', str(start)).replace('/usr/local/bin/esphome-logs', str(logs)))
-        result = subprocess.run(['bash', str(helper), '--no-pager'], capture_output=True)
+        helper.write_text(files['/usr/local/bin/esphome'].replace('/usr/local/bin/esphome start', str(start)).replace('/usr/local/bin/esphome logs', str(logs)))
+        result = subprocess.run(['bash', str(helper), 'pairing', '--no-pager'], capture_output=True)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.split(b'\0')[:-1], [b'--follow', b'--lines=30', b'--no-pager'])
-        result = subprocess.run(['bash', str(helper)], env={**os.environ, 'START_EXIT':'23'}, capture_output=True)
+        result = subprocess.run(['bash', str(helper), 'pairing'], env={**os.environ, 'START_EXIT':'23'}, capture_output=True)
         self.assertEqual(result.returncode, 23)
         self.assertEqual(result.stdout, b'')
 
@@ -418,13 +452,13 @@ class BuilderTests(unittest.TestCase):
             run0() { echo 'Unexpected privilege request' >&2; exit 99; }
             _journalctl() { printf '%s\0' "$COMP_CWORD" "${COMP_WORDS[@]}"; }
             _systemctl() { printf '%s\0' "$COMP_CWORD" "${COMP_WORDS[@]}"; }
-            COMP_WORDS=("$2" --output json)
-            COMP_CWORD=2
+            COMP_WORDS=(esphome "$2" --output json)
+            COMP_CWORD=3
             _esphome_complete
-            [[ $COMP_CWORD == 2 && ${COMP_WORDS[0]} == "$2" ]] || exit 98
+            [[ $COMP_CWORD == 3 && ${COMP_WORDS[0]} == esphome ]] || exit 98
         """
         for verb in ('logs', 'pairing', 'start', 'stop', 'restart', 'status', 'update', 'timers'):
-            result = subprocess.run(['bash', '-c', harness, 'completion-test', str(script), 'esphome-' + verb], capture_output=True, check=True)
+            result = subprocess.run(['bash', '-c', harness, 'completion-test', str(script), verb], capture_output=True, check=True)
             args = result.stdout.decode().split('\0')[:-1]
             if verb in ('logs', 'pairing'):
                 self.assertEqual(args, ['2', 'journalctl', '--output', 'json'])
@@ -432,8 +466,8 @@ class BuilderTests(unittest.TestCase):
                 command = 'start' if verb == 'update' else 'list-timers' if verb == 'timers' else verb
                 units = ['podman-auto-update.timer', 'esphome-image-clean.timer'] if verb == 'timers' else ['podman-auto-update.service'] if verb == 'update' else ['esphome-builder.service']
                 self.assertEqual(args, [str(4 + len(units)), 'systemctl', '--user', command, *units, '--output', 'json'])
-        no_unit_query = harness.replace('COMP_WORDS=("$2" --output json)', 'COMP_WORDS=("$2" extra-unit)').replace('COMP_CWORD=2', 'COMP_CWORD=1').replace('$COMP_CWORD == 2', '$COMP_CWORD == 1')
-        result = subprocess.run(['bash', '-c', no_unit_query, 'completion-test', str(script), 'esphome-start'], capture_output=True, check=True)
+        no_unit_query = harness.replace('COMP_WORDS=(esphome "$2" --output json)', 'COMP_WORDS=(esphome "$2" extra-unit)').replace('COMP_CWORD=3', 'COMP_CWORD=2').replace('$COMP_CWORD == 3', '$COMP_CWORD == 2')
+        result = subprocess.run(['bash', '-c', no_unit_query, 'completion-test', str(script), 'start'], capture_output=True, check=True)
         self.assertEqual(result.stdout, b'')
 
     @unittest.skipUnless(os.name == 'posix' and shutil.which('bash') and
@@ -445,16 +479,19 @@ class BuilderTests(unittest.TestCase):
             source /usr/share/bash-completion/bash_completion
             source "$1"
             run0() { echo 'Unexpected privilege request' >&2; exit 99; }
-            COMP_WORDS=(esphome-logs --fo); COMP_CWORD=1
-            COMP_LINE='esphome-logs --fo'; COMP_POINT=${#COMP_LINE}
+            COMP_WORDS=(esphome pa); COMP_CWORD=1
+            _esphome_complete
+            [[ " ${COMPREPLY[*]} " == *' pairing '* ]] || exit 4
+            COMP_WORDS=(esphome logs --fo); COMP_CWORD=2
+            COMP_LINE='esphome logs --fo'; COMP_POINT=${#COMP_LINE}
             _esphome_complete
             [[ " ${COMPREPLY[*]} " == *' --follow '* ]] || exit 1
-            COMP_WORDS=(esphome-start --no-bl); COMP_CWORD=1
-            COMP_LINE='esphome-start --no-bl'; COMP_POINT=${#COMP_LINE}
+            COMP_WORDS=(esphome start --no-bl); COMP_CWORD=2
+            COMP_LINE='esphome start --no-bl'; COMP_POINT=${#COMP_LINE}
             _esphome_complete
             [[ " ${COMPREPLY[*]} " == *' --no-block '* ]] || exit 2
-            COMP_WORDS=(esphome-logs -o j); COMP_CWORD=2
-            COMP_LINE='esphome-logs -o j'; COMP_POINT=${#COMP_LINE}
+            COMP_WORDS=(esphome logs -o j); COMP_CWORD=3
+            COMP_LINE='esphome logs -o j'; COMP_POINT=${#COMP_LINE}
             _esphome_complete
             [[ " ${COMPREPLY[*]} " == *' json '* ]] || exit 3
         """
@@ -486,7 +523,7 @@ class BuilderTests(unittest.TestCase):
     @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'Needs POSIX bash')
     def test_disable_autologin_retries_and_self_deletes_only_on_success(self):
         files = decode_files(B['configs'](KEY, 'operator'))
-        source = files['/usr/local/bin/esphome-disable-autologin']
+        source = files['/usr/local/libexec/esphome-disable-autologin']
         self.assertIn('set -euo pipefail', source)
         for failure in ('none', 'partial', 'reload', 'self'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
@@ -502,10 +539,10 @@ class BuilderTests(unittest.TestCase):
                 mock_ctl = root / 'systemctl'
                 mock_ctl.write_text('#!/bin/bash\n[[ "$*" == daemon-reload ]] || exit 99\ntouch "$RELOAD_LOG"\nexit "${FAIL_RELOAD:-0}"\n')
                 for executable in (mock_rm, mock_ctl): executable.chmod(0o755)
-                helper.write_text(source.replace('/etc/systemd/system', str(root)).replace('/usr/local/bin/esphome-disable-autologin', str(helper)).replace('/usr/bin/rm', str(mock_rm)).replace('/usr/bin/systemctl', str(mock_ctl)))
+                helper.write_text(source.replace('/etc/systemd/system', str(root)).replace('/usr/local/libexec/esphome-disable-autologin', str(helper)).replace('/usr/bin/rm', str(mock_rm)).replace('/usr/bin/systemctl', str(mock_ctl)))
                 log = root / 'reloaded'
                 env = dict(os.environ, RELOAD_LOG=str(log), FAIL_PATH=str(second) if failure == 'partial' else str(helper) if failure == 'self' else '', FAIL_RELOAD='1' if failure == 'reload' else '0')
-                result = subprocess.run(['bash', str(helper)], env=env, capture_output=True)
+                result = subprocess.run(['bash', str(helper), 'pairing'], env=env, capture_output=True)
                 if failure == 'none':
                     self.assertEqual(result.returncode, 0)
                     self.assertFalse(helper.exists())
@@ -515,7 +552,7 @@ class BuilderTests(unittest.TestCase):
                     self.assertFalse(first.exists())
                     self.assertEqual(log.exists(), failure != 'partial')
                     env.update(FAIL_PATH='', FAIL_RELOAD='0')
-                    subprocess.run(['bash', str(helper)], env=env, capture_output=True, check=True)
+                    subprocess.run(['bash', str(helper), 'pairing'], env=env, capture_output=True, check=True)
                     self.assertFalse(helper.exists())
                 self.assertFalse(first.exists())
                 self.assertFalse(second.exists())

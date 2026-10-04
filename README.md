@@ -2,31 +2,53 @@
 
 An ESPHome remote builder based on Fedora CoreOS stable, for Hyper-V and QEMU/KVM hosts including Proxmox. It runs the stable ESPHome container as an unprivileged user and updates automatically.
 
+## Create or download the installer
+
+Download and verify the original Fedora CoreOS **stable x86_64 Live DVD** from [Fedora](https://fedoraproject.org/coreos/download/). Extract the release’s **setup ZIP**, or clone this repository. With Python 3.11+:
+
+```sh
+python3 build-installer.py fedora-coreos-live.iso esphome-appliance.iso
+```
+
+For optional settings, copy `.env.example` to `.env`, edit it and add `--env .env` to the command. Settings cover disk-size bounds, NTP pools, account defaults and serial console. Public SSH keys only; never embed private keys. Set `SERIAL_CONSOLE=true` for an installed serial console alongside VGA; Proxmox users can add `serial0` for terminal copy/paste.
+
+To check a prebuilt or locally built ISO against the original without rebuilding:
+
+```sh
+python3 build-installer.py verify fedora-coreos-live.iso esphome-appliance.iso
+```
+
+Add `--ignition esphome-appliance.ign` to compare against the setup ZIP's expected configuration, or `--extract-ignition inspected.ign` to save it for review. Personalized builds need their own expected configuration. Verification proves the original bytes were preserved; review the Ignition instructions too.
+
+Prebuilt ISOs are available from [Releases](https://github.com/Gunni/esphome-builder-vm-appliance/releases) for convenience.
+
+The builder modifies only the ISO’s reserved Ignition area and verifies all other bytes remain unchanged. The setup ZIP contains the Ignition configuration and source for inspection; the matching Fedora manifest identifies the original ISO and checksum. [Upstream embedding and inspection commands](https://coreos.github.io/coreos-installer/cmd/iso/).
+
 ## Install
 
-1. Download the **ISO** and verify the checksum from [Releases](https://github.com/Gunni/esphome-builder-vm-appliance/releases).
+1. Use the installer ISO from releases, or the above manual creation instructions.
 2. Create a dedicated VM with a **new 64 GB disk**, networking in a vlan your existing esphome can access. If you use UEFI on Hyper-V, ensure you use the **Microsoft UEFI Certificate Authority** Secure Boot template.
 3. Ensure boot order is HDD, then ISO.
 4. Boot the ISO. Enter your Linux management username, then optionally, enter your GitHub username to import the SSH keys from it, or press Enter to use console access only.
 
-**The installer automatically writes to the largest, non-removable disk.** By default the disk limits are 50–80 GiB. An occupied disk requires typing `ERASE <device>` at the console; mounted disks, swap and active mapped devices are refused. This overwrites the installation; it is not a secure erase.
+**The installer automatically writes to the largest, non-removable disk.** The recommended range is 50–2048 GiB; outside it, type `USE <device>` to continue. Disks under 10 GiB are refused to leave room for the OS and boot partitions; small disks can still run out of container, build or update space. An occupied disk requires typing `ERASE <device>` at the console; mounted disks, swap and active mapped devices are refused. This overwrites the installation; it is not a secure erase.
 
 Treat VM console access as administrator access: it logs into your management account automatically, with passwordless `run0`; SSH requires ssh key authentication you supplied or added manually. The hostname is `esphome-builder-<12 hex characters>` and stays the same across reboots.
 
 ## Pair and use
 
 IP addresses and SSH Host keys are printed on the console screen, and it also gets automatically logged in.
-Run `esphome-pairing` to start the builder and show its pairing fingerprint and one-time key. Pairing does not start on boot; after pairing, the builder starts normally. An expired pairing window stays closed until you start it again. In your existing ESPHome dashboard, choose **Settings > Send builds > Pair with a build server**, enter the address and port **6055**, and verify the pairing details.
+Run `esphome pairing` to start the builder and show its pairing fingerprint and one-time key. Pairing does not start on boot; after pairing, the builder starts normally. An expired pairing window stays closed until you start it again. In your existing ESPHome dashboard, choose **Settings > Send builds > Pair with a build server**, enter the address and port **6055**, and verify the pairing details.
 
 | Command | Purpose |
 | --- | --- |
-| `esphome-pairing` | Start first pairing and follow its output |
-| `esphome-status` | ESPHome Builder status |
-| `esphome-logs -f` | Follow ESPHome builder logs; accepts `journalctl` arguments |
-| `esphome-start`, `esphome-stop`, `esphome-restart` | Control the ESPHome builder |
-| `esphome-shell` | ESPHome Builder container shell |
-| `esphome-update` | Check for a container update |
-| `esphome-timers` | Show container update and cleanup schedules |
+| `esphome pairing` | Start first pairing and follow its output |
+| `esphome status` | ESPHome Builder status |
+| `esphome logs -f` | Follow ESPHome builder logs; accepts `journalctl` arguments |
+| `esphome start`, `esphome stop`, `esphome restart` | Control the ESPHome builder |
+| `esphome shell` | ESPHome Builder container shell |
+| `esphome update` | Check for a container update |
+| `esphome timers` | Show container update and cleanup schedules |
 | `run0 journalctl -u esphome-tools -b` | Diagnose initial setup |
 
 The helpers handle account switching and support Bash completion.
@@ -38,22 +60,10 @@ Back up `/var/lib/esphome/config` if you wish to preserve pairing; builds and ca
 To disable console autologin, first set a password with `run0 passwd <your-username>`, then run:
 
 ```sh
-run0 esphome-disable-autologin
+esphome disable-autologin
 ```
 
 The next console session requires a normal login. The helper deletes itself after success; a failed attempt can be retried.
-
-## Build locally
-
-Download and verify the original Fedora CoreOS **stable x86_64 Live DVD** from [Fedora](https://fedoraproject.org/coreos/download/). Extract the release’s **setup ZIP**, or clone this repository. With Python 3.11+:
-
-```sh
-python3 build-installer.py fedora-coreos-live.iso esphome-appliance.iso
-```
-
-For optional settings, copy `.env.example` to `.env`, edit it and add `--env .env` to the command. Settings cover disk-size bounds, NTP pools, account defaults and serial console. Public SSH keys only; never embed private keys. Set `SERIAL_CONSOLE=true` for an installed serial console alongside VGA; Proxmox users can add `serial0` for terminal copy/paste.
-
-The builder modifies only the ISO’s reserved Ignition area and verifies all other bytes remain unchanged. The setup ZIP contains the Ignition configuration and source for inspection; the matching Fedora manifest identifies the original ISO and checksum. [Upstream embedding and inspection commands](https://coreos.github.io/coreos-installer/cmd/iso/).
 
 ## Builds and releases
 
